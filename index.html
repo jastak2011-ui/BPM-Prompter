@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#06162f">
+    <title>BPM Prompter</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="stage performance-view" id="stage" aria-live="polite">
+        <div class="pulse-ring" id="pulseRing"></div>
+
+        <div class="top-actions">
+          <button id="openSetlistButton" class="icon-button" type="button" aria-label="Open setlist">≡</button>
+          <button id="openSettingsButton" class="icon-button" type="button" aria-label="Open settings">⚙</button>
+        </div>
+
+        <button id="previousSongButton" class="song-arrow nav-button previous" type="button" aria-label="Previous song">‹</button>
+        <button id="nextSongButton" class="song-arrow nav-button next" type="button" aria-label="Next song">›</button>
+
+        <div class="bpm-wrap" id="performanceTapZone">
+          <header class="performance-header song-header">
+            <div class="target-line" id="targetBpmLine">No target selected</div>
+            <div class="song-title" id="songTitleReadout">Add songs in Setlist</div>
+            <div class="song-artist" id="songArtistReadout"></div>
+            <div class="song-count" id="songPositionReadout">0 of 0</div>
+          </header>
+
+          <div class="bpm-display bpm-zone">
+            <div class="bpm-stack">
+              <div class="bpm-number" id="bpmValue">--</div>
+              <div class="bpm-label">CURRENT</div>
+            </div>
+          </div>
+
+          <footer class="performance-status status-zone">
+            <div class="mic-state" id="micStateReadout">
+              <span class="mic-dot stopped" id="micStateDot"></span>
+              <span id="micStateText">Stopped</span>
+            </div>
+            <div class="status tempo-status" id="statusText">Tap to start listening</div>
+            <div class="tempo-diff" id="tempoDiffReadout">--</div>
+            <div class="song-notes" id="songNotesReadout"></div>
+          </footer>
+        </div>
+      </section>
+
+      <section class="setlist-panel app-panel hidden" id="setlistView" aria-label="Setlist management">
+        <header class="panel-header">
+          <div>
+            <p class="eyebrow">Setlist</p>
+            <h1 id="setlistHeading">Song Targets</h1>
+            <div class="panel-subtitle" id="setlistMetadataReadout"></div>
+          </div>
+          <button id="closeSetlistButton" class="icon-button" type="button" aria-label="Close setlist">X</button>
+        </header>
+
+        <div class="import-row">
+          <button id="importCsvButton" type="button">Import CSV</button>
+          <input id="importCsvInput" class="visually-hidden" type="file" accept=".csv,text/csv">
+          <div class="import-summary" id="importSummaryReadout"></div>
+        </div>
+
+        <form class="song-form" id="songForm">
+          <label class="field">
+            <span>Song Title</span>
+            <input id="songTitleInput" type="text" autocomplete="off" required>
+          </label>
+          <label class="field">
+            <span>Artist</span>
+            <input id="songArtistInput" type="text" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>Target BPM</span>
+            <input id="songBpmInput" type="number" min="40" max="240">
+          </label>
+          <label class="field notes-field">
+            <span>Notes</span>
+            <input id="songNotesInput" type="text" autocomplete="off">
+          </label>
+          <button id="addSongButton" type="submit">Add Song</button>
+        </form>
+
+        <div class="setlist-items" id="setlistItems"></div>
+      </section>
+
+      <section class="controls settings-panel app-panel hidden" id="settingsView" aria-label="BPM Prompter settings">
+        <header class="panel-header">
+          <div>
+            <p class="eyebrow">Settings</p>
+            <h1>Detection Controls</h1>
+          </div>
+          <button id="closeSettingsButton" class="icon-button" type="button" aria-label="Close settings">X</button>
+        </header>
+
+        <div class="button-row">
+          <button id="startButton" type="button">Start Listening</button>
+          <button id="stopButton" type="button" disabled>Stop</button>
+          <button id="fullscreenButton" type="button">Fullscreen</button>
+        </div>
+
+        <div class="control-grid">
+          <label class="field">
+            <span>Tempo Tolerance</span>
+            <input id="tempoToleranceInput" type="number" min="0.5" max="12" step="0.5" value="2">
+          </label>
+
+          <label class="field">
+            <span>Debug Mode</span>
+            <select id="debugModeSelect">
+              <option value="off">Off</option>
+              <option value="on">On</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Orientation</span>
+            <select id="orientationSelect">
+              <option value="normal">Normal</option>
+              <option value="cw">Rotate 90 clockwise</option>
+              <option value="ccw">Rotate 90 counterclockwise</option>
+              <option value="upside-down">Upside down</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Fill Portrait Screen</span>
+            <select id="portraitFillSelect">
+              <option value="fit">Fit mode</option>
+              <option value="fill">Fill mode</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Sensitivity</span>
+            <input id="sensitivitySlider" type="range" min="1" max="100" value="65">
+          </label>
+
+          <label class="field">
+            <span>Min Confidence</span>
+            <input id="confidenceSlider" type="range" min="1" max="100" value="25">
+          </label>
+
+          <label class="field">
+            <span>Noise Floor</span>
+            <input id="noiseFloorSlider" type="range" min="1" max="100" value="18">
+          </label>
+
+          <label class="field">
+            <span>Refractory</span>
+            <input id="refractorySlider" type="range" min="150" max="400" value="250">
+          </label>
+
+          <label class="field">
+            <span>Tempo Feel</span>
+            <select id="tempoFeelSelect">
+              <option value="normal">Normal</option>
+              <option value="slower">Prefer slower / half-time</option>
+              <option value="faster">Prefer faster / double-time</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Expected Range</span>
+            <select id="rangePresetSelect">
+              <option value="medium">Medium: 80-140</option>
+              <option value="slow">Slow: 60-100</option>
+              <option value="fast">Fast: 120-180</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Target BPM Assist</span>
+            <input id="targetBpmInput" type="number" min="40" max="220" placeholder="e.g. 143">
+          </label>
+
+          <label class="field">
+            <span>Lock Speed</span>
+            <select id="lockSpeedSelect">
+              <option value="balanced">Balanced</option>
+              <option value="fast">Fast</option>
+              <option value="accurate">Accurate</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Min BPM</span>
+            <input id="minBpmInput" type="number" min="30" max="240" value="60">
+          </label>
+
+          <label class="field">
+            <span>Max BPM</span>
+            <input id="maxBpmInput" type="number" min="40" max="300" value="180">
+          </label>
+
+          <button id="lockButton" type="button">Lock BPM</button>
+          <button id="calibrateButton" type="button">Tap Tempo Calibrate</button>
+          <button id="clapModeButton" type="button">Test Clap Mode</button>
+          <button id="tapButton" class="tap-button" type="button">Tap Tempo</button>
+        </div>
+
+        <div class="debug-panel" id="debugPanel" aria-label="Microphone diagnostics">
+          <div class="meter" aria-label="Live microphone input level">
+            <div class="meter-fill" id="levelMeter"></div>
+          </div>
+          <div class="debug-stats">
+            <span>Avg Level: <strong id="levelReadout">0.000</strong></span>
+            <span>Threshold: <strong id="thresholdReadout">0.000</strong></span>
+            <span>Raw: <strong id="rawBpmReadout">--</strong></span>
+            <span>Corrected: <strong id="correctedBpmReadout">--</strong></span>
+            <span>Best: <strong id="bestCandidateReadout">--</strong></span>
+            <span>Half: <strong id="halfCandidateReadout">--</strong></span>
+            <span>Double: <strong id="doubleCandidateReadout">--</strong></span>
+            <span>Final: <strong id="finalBpmReadout">--</strong></span>
+            <span>Selected: <strong id="selectedBpmReadout">--</strong></span>
+            <span>Reason: <strong id="selectionReasonReadout">--</strong></span>
+            <span>Target Error: <strong id="targetErrorReadout">--</strong></span>
+            <span>Top 5: <strong id="topCandidatesReadout">--</strong></span>
+            <span>Fast: <strong id="fastEstimateReadout">--</strong></span>
+            <span>Stable Candidate: <strong id="stableCandidateReadout">--</strong></span>
+            <span>Display Source: <strong id="displaySourceReadout">--</strong></span>
+            <span>Mix Density: <strong id="mixDensityReadout">0%</strong></span>
+            <span>Kick Confidence: <strong id="kickConfidenceReadout">0%</strong></span>
+            <span>Snare Confidence: <strong id="snareConfidenceReadout">0%</strong></span>
+            <span>Rejected High/Noise: <strong id="rejectionReadout">0</strong></span>
+            <span>Hold Time: <strong id="holdTimeReadout">--</strong></span>
+            <span>First Estimate: <strong id="firstEstimateReadout">--</strong></span>
+            <span>Stable Lock: <strong id="stableLockReadout">--</strong></span>
+            <span>Switch: <strong id="switchReasonReadout">--</strong></span>
+            <span>State: <strong id="tempoStateReadout">Waiting for rhythm...</strong></span>
+            <span>Confidence: <strong id="confidenceReadout">0%</strong></span>
+            <span>Onsets: <strong id="peakCounter">0</strong></span>
+            <span>Raw Onsets: <strong id="rawOnsetCounter">0</strong></span>
+            <span>Grouped Beats: <strong id="groupedBeatCounter">0</strong></span>
+            <span>Ignored: <strong id="ignoredDoubleHitCounter">0</strong></span>
+            <span>Refractory: <strong id="refractoryReadout">250ms</strong></span>
+            <span>Mode: <strong id="detectionModeReadout">no signal</strong></span>
+            <span>Mic: <strong id="streamStatus">inactive</strong></span>
+          </div>
+          <pre class="screen-log" id="screenLog">Waiting to start...</pre>
+        </div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
