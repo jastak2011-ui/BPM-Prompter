@@ -91,6 +91,15 @@ const tempoToleranceInput = document.getElementById("tempoToleranceInput");
 const debugModeSelect = document.getElementById("debugModeSelect");
 const targetAnchoringSelect = document.getElementById("targetAnchoringSelect");
 const debugPanel = document.getElementById("debugPanel");
+const testTargetBpmInput = document.getElementById("testTargetBpmInput");
+const testSongNameInput = document.getElementById("testSongNameInput");
+const testNotesInput = document.getElementById("testNotesInput");
+const startAccuracyTestButton = document.getElementById("startAccuracyTestButton");
+const stopAccuracyTestButton = document.getElementById("stopAccuracyTestButton");
+const exportAccuracyCsvButton = document.getElementById("exportAccuracyCsvButton");
+const clearAccuracyLogButton = document.getElementById("clearAccuracyLogButton");
+const accuracySummaryReadout = document.getElementById("accuracySummaryReadout");
+const markerButtons = document.querySelectorAll(".marker-button");
 
 const ORIENTATION_KEY = "bpm-prompter-orientation";
 const PORTRAIT_FILL_KEY = "bpm-prompter-portrait-fill";
@@ -165,6 +174,7 @@ let lastMidBeatTime = 0;
 let kickConfidence = 0;
 let currentStableCandidate = null;
 let snareConfidence = 0;
+let highBandConfidence = 0;
 let mixDensity = 0;
 let rejectedHighNoiseCount = 0;
 let onsetEventHistory = [];
@@ -184,6 +194,11 @@ let swipeStartedOnNav = false;
 let performanceTapTimer = null;
 let lastNavTime = 0;
 let lastNavPointerTime = 0;
+let accuracyTestActive = false;
+let accuracyTestStartedAt = 0;
+let accuracyTestTimer = null;
+let accuracyTestRows = [];
+let pendingAccuracyMarkers = [];
 
 function setStatus(message) {
   lastStatusMessage = message;
@@ -846,6 +861,214 @@ function updateTargetErrorReadout(selectedBpm, confidence) {
   const diff = selectedBpm - target;
   const sign = diff >= 0 ? "+" : "";
   targetErrorReadout.textContent = `${Math.round(selectedBpm)} vs ${Math.round(target)} (${sign}${diff.toFixed(1)}, ${Math.round(confidence)}%)`;
+}
+
+function parseReadoutNumber(text) {
+  const match = String(text || "").match(/-?\d+(\.\d+)?/);
+  return match ? Number(match[0]) : null;
+}
+
+function getAccuracyTargetBpm() {
+  const testTarget = Number(testTargetBpmInput.value);
+  if (testTarget >= 40 && testTarget <= 240) {
+    return testTarget;
+  }
+  return getSongTargetBpm() || getTargetBpm();
+}
+
+function inferSelectedEstimator() {
+  const source = displaySourceReadout.textContent.toLowerCase();
+  const reason = selectionReasonReadout.textContent.toLowerCase();
+  const consensus = consensusReadout.textContent.toLowerCase();
+  if (tempoState === "holding" || source.includes("stable") && lastStatusMessage === "Holding BPM") {
+    return "held";
+  }
+  if (reason.includes("target") || consensus.includes("target")) {
+    return "target anchored";
+  }
+  if (reason.includes("spectral") || consensus.includes("spectral")) {
+    return "spectral";
+  }
+  return "onset";
+}
+
+function currentAccuracyRow(marker = "") {
+  const target = getAccuracyTargetBpm();
+  const finalBpm = smoothedBpm ? Number(smoothedBpm.toFixed(2)) : null;
+  const rawBpm = parseReadoutNumber(rawBpmReadout.textContent);
+  const confidence = parseReadoutNumber(confidenceReadout.textContent) || 0;
+  return {
+    timestamp_ms: Math.round(performance.now() - accuracyTestStartedAt),
+    timestamp_iso: new Date().toISOString(),
+    song_name: testSongNameInput.value.trim(),
+    test_notes: testNotesInput.value.trim(),
+    marker,
+    raw_detected_bpm: rawBpm,
+    final_displayed_bpm: finalBpm,
+    target_bpm: target,
+    error_from_target: target && finalBpm ? Number((finalBpm - target).toFixed(2)) : null,
+    confidence,
+    state: listening ? tempoState : "stopped",
+    selected_estimator: inferSelectedEstimator(),
+    top_5_candidates: topCandidatesReadout.textContent,
+    onset_count: beatCount,
+    raw_onset_count: rawOnsetCount,
+    rejected_onset_count: rejectedHighNoiseCount,
+    mix_density: Number(mixDensity.toFixed(3)),
+    low_band_confidence: Number(kickConfidence.toFixed(3)),
+    mid_band_confidence: Number(snareConfidence.toFixed(3)),
+    high_band_confidence: Number(highBandConfidence.toFixed(3))
+  };
+}
+
+function recordAccuracySample() {
+  if (!accuracyTestActive) {
+    return;
+  }
+  const marker = pendingAccuracyMarkers.join("|");
+  pendingAccuracyMarkers = [];
+  accuracyTestRows.push(currentAccuracyRow(marker));
+}
+
+function formatDurationFromMs(ms) {
+  return Number.isFinite(ms) ? `${(ms / 1000).toFixed(2)}s` : "--";
+}
+
+function summarizeAccuracyTest() {
+  if (!accuracyTestRows.length) {
+    accuracySummaryReadout.textContent = "No samples recorded.";
+    return;
+  }
+
+  const rowsWithBpm = accuracyTestRows.filter((row) => Number.isFinite(row.final_displayed_bpm));
+  const rowsWithError = accuracyTestRows.filter((row) => Number.isFinite(row.error_from_target));
+  const firstBpm = rowsWithBpm[0];
+  const firstWithin3 = rowsWithError.find((row) => Math.abs(row.error_from_target) <= 3);
+  const firstStable = accuracyTestRows.find((row) => row.state === "stable");
+  const avgError = rowsWithError.length
+    ? rowsWithError.reduce((total, row) => total + Math.abs(row.error_from_target), 0) / rowsWithError.length
+    : null;
+  const maxError = rowsWithError.length
+    ? Math.max(...rowsWithError.map((row) => Math.abs(row.error_from_target)))
+    : null;
+  const within2 = rowsWithError.length
+    ? rowsWithError.filter((row) => Math.abs(row.error_from_target) <= 2).length / rowsWithError.length * 100
+    : null;
+  const within5 = rowsWithError.length
+    ? rowsWithError.filter((row) => Math.abs(row.error_from_target) <= 5).length / rowsWithError.length * 100
+    : null;
+
+  let jumpsOver5 = 0;
+  let falseHalfDoubleLocks = 0;
+  let previousBpm = null;
+  let previousFalseLock = false;
+  for (const row of rowsWithBpm) {
+    if (previousBpm !== null && Math.abs(row.final_displayed_bpm - previousBpm) > 5) {
+      jumpsOver5 += 1;
+    }
+    previousBpm = row.final_displayed_bpm;
+
+    const target = row.target_bpm;
+    const falseLock = target && (
+      Math.abs(row.final_displayed_bpm - target / 2) <= 3
+      || Math.abs(row.final_displayed_bpm - target * 2) <= 3
+    );
+    if (falseLock && !previousFalseLock) {
+      falseHalfDoubleLocks += 1;
+    }
+    previousFalseLock = falseLock;
+  }
+
+  accuracySummaryReadout.textContent = [
+    `Samples: ${accuracyTestRows.length}`,
+    `Time to first BPM: ${formatDurationFromMs(firstBpm?.timestamp_ms)}`,
+    `Time to within +/- 3 BPM: ${formatDurationFromMs(firstWithin3?.timestamp_ms)}`,
+    `Time to stable lock: ${formatDurationFromMs(firstStable?.timestamp_ms)}`,
+    `Average error: ${avgError === null ? "--" : avgError.toFixed(2)} BPM`,
+    `Max error: ${maxError === null ? "--" : maxError.toFixed(2)} BPM`,
+    `Within +/- 2 BPM: ${within2 === null ? "--" : `${within2.toFixed(1)}%`}`,
+    `Within +/- 5 BPM: ${within5 === null ? "--" : `${within5.toFixed(1)}%`}`,
+    `Jumps > 5 BPM: ${jumpsOver5}`,
+    `False half/double locks: ${falseHalfDoubleLocks}`
+  ].join("\n");
+}
+
+function startAccuracyTest() {
+  accuracyTestRows = [];
+  pendingAccuracyMarkers = [];
+  accuracyTestStartedAt = performance.now();
+  accuracyTestActive = true;
+  startAccuracyTestButton.disabled = true;
+  stopAccuracyTestButton.disabled = false;
+  exportAccuracyCsvButton.disabled = true;
+  accuracySummaryReadout.textContent = "Recording test samples every 250ms...";
+  recordAccuracySample();
+  accuracyTestTimer = window.setInterval(recordAccuracySample, 250);
+  screen("accuracy test started");
+}
+
+function stopAccuracyTest() {
+  if (!accuracyTestActive) {
+    return;
+  }
+  accuracyTestActive = false;
+  window.clearInterval(accuracyTestTimer);
+  accuracyTestTimer = null;
+  startAccuracyTestButton.disabled = false;
+  stopAccuracyTestButton.disabled = true;
+  exportAccuracyCsvButton.disabled = accuracyTestRows.length === 0;
+  summarizeAccuracyTest();
+  screen("accuracy test stopped");
+}
+
+function clearAccuracyLog() {
+  accuracyTestRows = [];
+  pendingAccuracyMarkers = [];
+  exportAccuracyCsvButton.disabled = true;
+  accuracySummaryReadout.textContent = "Test log cleared.";
+  screen("accuracy test log cleared");
+}
+
+function csvEscape(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  const text = String(value);
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function exportAccuracyCsv() {
+  if (!accuracyTestRows.length) {
+    accuracySummaryReadout.textContent = "No test samples to export.";
+    return;
+  }
+
+  const headers = Object.keys(accuracyTestRows[0]);
+  const csv = [
+    headers.join(","),
+    ...accuracyTestRows.map((row) => headers.map((header) => csvEscape(row[header])).join(","))
+  ].join("\n");
+  const song = testSongNameInput.value.trim() || getCurrentSong()?.title || "bpm-test";
+  const safeSong = song.replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase() || "bpm-test";
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${safeSong}-accuracy-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  screen(`accuracy CSV exported: ${accuracyTestRows.length} rows`);
+}
+
+function addAccuracyMarker(marker) {
+  if (!accuracyTestActive) {
+    accuracySummaryReadout.textContent = `Marker "${marker}" queued. Start a test to record samples.`;
+    return;
+  }
+  accuracyTestRows.push(currentAccuracyRow(marker));
+  screen(`accuracy marker: ${marker}`);
 }
 
 function triggerPulse() {
@@ -2089,6 +2312,12 @@ function handleFrame(frame) {
   if (midStrengthHistory.length > 90) {
     midStrengthHistory.shift();
   }
+  const highRecent = bandFluxHistory[2] || [];
+  const highThreshold = Math.max(getNoiseFloor() * 0.7, median(highRecent) + mean(highRecent) * 1.1);
+  const highActivity = highRecent.length
+    ? highRecent.filter((value) => value > highThreshold).length / highRecent.length
+    : 0;
+  highBandConfidence = highBandConfidence * 0.82 + highActivity * 0.18;
 
   const kickThreshold = Math.max(getNoiseFloor() * 0.9, median(kickStrengthHistory) + mean(kickStrengthHistory) * 1.05);
   const midThreshold = Math.max(getNoiseFloor() * 0.75, median(midStrengthHistory) + mean(midStrengthHistory) * 1.15);
@@ -2165,6 +2394,7 @@ function resetDetectionState() {
   predictionMisses = 0;
   currentStableCandidate = null;
   snareConfidence = 0;
+  highBandConfidence = 0;
   mixDensity = 0;
   rejectedHighNoiseCount = 0;
   onsetEventHistory = [];
@@ -2692,7 +2922,15 @@ function validateDomReferences() {
     "tempoToleranceInput",
     "debugModeSelect",
     "targetAnchoringSelect",
-    "debugPanel"
+    "debugPanel",
+    "testTargetBpmInput",
+    "testSongNameInput",
+    "testNotesInput",
+    "startAccuracyTestButton",
+    "stopAccuracyTestButton",
+    "exportAccuracyCsvButton",
+    "clearAccuracyLogButton",
+    "accuracySummaryReadout"
   ];
   const missing = requiredIds.filter((id) => !document.getElementById(id));
   const duplicates = requiredIds.filter((id) => document.querySelectorAll(`#${id}`).length > 1);
@@ -2738,6 +2976,13 @@ importCsvInput.addEventListener("change", () => {
   importCsvInput.value = "";
 });
 debugModeSelect.addEventListener("change", applyDebugMode);
+startAccuracyTestButton.addEventListener("click", startAccuracyTest);
+stopAccuracyTestButton.addEventListener("click", stopAccuracyTest);
+exportAccuracyCsvButton.addEventListener("click", exportAccuracyCsv);
+clearAccuracyLogButton.addEventListener("click", clearAccuracyLog);
+markerButtons.forEach((button) => {
+  button.addEventListener("click", () => addAccuracyMarker(button.dataset.marker));
+});
 targetAnchoringSelect.addEventListener("change", () => {
   try {
     localStorage.setItem(TARGET_ANCHORING_KEY, targetAnchoringSelect.value);

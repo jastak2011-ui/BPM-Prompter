@@ -253,6 +253,37 @@
             <span>Mode: <strong id="detectionModeReadout">no signal</strong></span>
             <span>Mic: <strong id="streamStatus">inactive</strong></span>
           </div>
+          <div class="accuracy-test-panel" id="accuracyTestPanel" aria-label="BPM accuracy test mode">
+            <h2>BPM Accuracy Test Mode</h2>
+            <div class="test-grid">
+              <label class="field">
+                <span>Known Target BPM</span>
+                <input id="testTargetBpmInput" type="number" min="40" max="240" placeholder="e.g. 125">
+              </label>
+              <label class="field">
+                <span>Song Name</span>
+                <input id="testSongNameInput" type="text" autocomplete="off" placeholder="Reference track">
+              </label>
+              <label class="field test-notes-field">
+                <span>Test Notes</span>
+                <input id="testNotesInput" type="text" autocomplete="off" placeholder="Speaker, section, phone position">
+              </label>
+            </div>
+            <div class="test-actions">
+              <button id="startAccuracyTestButton" type="button">Start Test</button>
+              <button id="stopAccuracyTestButton" type="button" disabled>Stop Test</button>
+              <button id="exportAccuracyCsvButton" type="button" disabled>Export CSV</button>
+              <button id="clearAccuracyLogButton" type="button">Clear Test Log</button>
+            </div>
+            <div class="marker-actions" aria-label="Test markers">
+              <button class="marker-button" data-marker="Intro" type="button">Intro</button>
+              <button class="marker-button" data-marker="Full Band" type="button">Full Band</button>
+              <button class="marker-button" data-marker="Fill" type="button">Fill</button>
+              <button class="marker-button" data-marker="Chorus" type="button">Chorus</button>
+              <button class="marker-button" data-marker="Breakdown" type="button">Breakdown</button>
+            </div>
+            <div class="test-summary" id="accuracySummaryReadout">No test run yet.</div>
+          </div>
           <pre class="screen-log" id="screenLog">Waiting to start...</pre>
         </div>
       </section>
