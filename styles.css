@@ -382,8 +382,9 @@ input {
 .app-panel {
   position: fixed;
   inset: 0;
-  z-index: 10;
+  z-index: 20;
   overflow: auto;
+  pointer-events: auto;
   padding: max(1rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right)) max(1rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
   background:
     radial-gradient(circle at 16% 0%, rgba(45, 140, 255, 0.25), transparent 20rem),
@@ -461,7 +462,7 @@ select,
 input[type="range"],
 input[type="number"],
 input[type="text"] {
-  min-height: 3.2rem;
+  min-height: 48px;
   border: 1px solid var(--border);
   border-radius: 0.45rem;
   background: var(--panel);
@@ -471,17 +472,29 @@ input[type="text"] {
 button {
   cursor: pointer;
   font-weight: 900;
+  padding: 0.75rem 1rem;
+  pointer-events: auto;
+  touch-action: manipulation;
+  transition: transform 120ms ease, filter 120ms ease, background-color 120ms ease, border-color 120ms ease, opacity 120ms ease;
 }
 
 button:active,
-button.active {
+button.active,
+button.button-pressed {
   transform: translateY(1px);
   background: var(--panel-strong);
 }
 
+button.button-pressed {
+  transform: scale(0.97);
+  filter: brightness(1.25);
+}
+
 button:disabled {
   cursor: default;
-  opacity: 0.45;
+  opacity: 0.38;
+  filter: grayscale(0.25);
+  transform: none;
 }
 
 #startButton,

@@ -305,6 +305,116 @@ function handleNavClick(event, direction, label, button) {
   navigateSong(direction, label, button);
 }
 
+function flashButtonPress(button) {
+  if (!button) {
+    return;
+  }
+  button.classList.add("button-pressed");
+  window.setTimeout(() => button.classList.remove("button-pressed"), 120);
+}
+
+function attachReliableButton(button, name, action) {
+  if (!button) {
+    console.warn(`Missing settings button: ${name}`);
+    return;
+  }
+
+  let pointerStart = null;
+  let pointerMoved = false;
+  let handledAt = 0;
+
+  const runAction = (event, result = "pressed") => {
+    if (button.disabled) {
+      return;
+    }
+    event?.preventDefault();
+    event?.stopPropagation();
+    handledAt = performance.now();
+    flashButtonPress(button);
+    action(event);
+    logSettingsAction(name, `${result}; active=${accuracyTestActive}; rows=${accuracyTestRows.length}`);
+  };
+
+  button.addEventListener("pointerdown", (event) => {
+    if (button.disabled) {
+      return;
+    }
+    pointerStart = { x: event.clientX, y: event.clientY, id: event.pointerId };
+    pointerMoved = false;
+    button.classList.add("button-pressed");
+    try {
+      button.setPointerCapture(event.pointerId);
+    } catch (error) {
+      // Pointer capture is best-effort; older browsers can still use the click fallback.
+    }
+  });
+
+  button.addEventListener("pointerup", (event) => {
+    if (!pointerStart || pointerStart.id !== event.pointerId) {
+      return;
+    }
+    const distance = Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y);
+    button.classList.remove("button-pressed");
+    pointerStart = null;
+    if (pointerMoved || distance > 12) {
+      logSettingsAction(name, "cancelled by scroll/move");
+      return;
+    }
+    runAction(event);
+  });
+
+  button.addEventListener("pointermove", (event) => {
+    if (!pointerStart || pointerStart.id !== event.pointerId) {
+      return;
+    }
+    if (Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y) > 12) {
+      pointerMoved = true;
+      button.classList.remove("button-pressed");
+    }
+  });
+
+  button.addEventListener("pointercancel", () => {
+    pointerStart = null;
+    pointerMoved = false;
+    button.classList.remove("button-pressed");
+    logSettingsAction(name, "cancelled");
+  });
+
+  button.addEventListener("click", (event) => {
+    if (performance.now() - handledAt < 420) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    runAction(event, "click fallback");
+  });
+}
+
+function attachSettingsButtonHandlers() {
+  const bindings = [
+    [startButton, "Start Listening", startListening],
+    [stopButton, "Stop Listening", stopListening],
+    [tapButton, "Tap Tempo", tapTempo],
+    [calibrateButton, "Tap Tempo Calibrate", tapTempoCalibrate],
+    [clapModeButton, "Test Clap Mode", toggleClapMode],
+    [lockButton, "Lock BPM", toggleLock],
+    [fullscreenButton, "Fullscreen", toggleFullscreen],
+    [closeSettingsButton, "Close Settings", closePanels],
+    [startAccuracyTestButton, "Start Test", startAccuracyTest],
+    [stopAccuracyTestButton, "Stop Test", stopAccuracyTest],
+    [exportAccuracyCsvButton, "Export CSV", exportAccuracyCsv],
+    [clearAccuracyLogButton, "Clear Test Log", clearAccuracyLog]
+  ];
+
+  bindings.forEach(([button, name, action]) => attachReliableButton(button, name, action));
+  if (!markerButtons.length) {
+    console.warn("Missing settings button group: marker-button");
+  }
+  markerButtons.forEach((button) => {
+    attachReliableButton(button, button.dataset.marker || "Marker", () => addAccuracyMarker(button.dataset.marker));
+  });
+}
+
 function getCurrentSong() {
   return setlist[currentSongIndex] || null;
 }
@@ -954,6 +1064,33 @@ function recordAccuracySample() {
   const marker = pendingAccuracyMarkers.join("|");
   pendingAccuracyMarkers = [];
   accuracyTestRows.push(currentAccuracyRow(marker));
+  updateAccuracyButtonStates();
+}
+
+function updateAccuracyButtonStates() {
+  startAccuracyTestButton.disabled = accuracyTestActive;
+  stopAccuracyTestButton.disabled = !accuracyTestActive;
+  exportAccuracyCsvButton.disabled = accuracyTestRows.length === 0;
+  clearAccuracyLogButton.disabled = accuracyTestRows.length === 0;
+}
+
+function showTestConfirmation(message) {
+  accuracySummaryReadout.textContent = message;
+}
+
+function logSettingsAction(name, result) {
+  if (debugModeSelect.value !== "on") {
+    return;
+  }
+  const entry = {
+    button: name,
+    timestamp: new Date().toISOString(),
+    result,
+    testActive: accuracyTestActive,
+    testRows: accuracyTestRows.length
+  };
+  console.log("settings button pressed", entry);
+  screen(`${name}: ${result} (${entry.timestamp})`);
 }
 
 function formatDurationFromMs(ms) {
@@ -1020,16 +1157,18 @@ function summarizeAccuracyTest() {
 }
 
 function startAccuracyTest() {
+  if (accuracyTestActive) {
+    showTestConfirmation("Test already running");
+    return;
+  }
   accuracyTestRows = [];
   pendingAccuracyMarkers = [];
   accuracyTestStartedAt = performance.now();
   accuracyTestActive = true;
-  startAccuracyTestButton.disabled = true;
-  stopAccuracyTestButton.disabled = false;
-  exportAccuracyCsvButton.disabled = true;
-  accuracySummaryReadout.textContent = "Recording test samples every 250ms...";
+  showTestConfirmation("Test started");
   recordAccuracySample();
   accuracyTestTimer = window.setInterval(recordAccuracySample, 250);
+  updateAccuracyButtonStates();
   screen("accuracy test started");
 }
 
@@ -1040,18 +1179,17 @@ function stopAccuracyTest() {
   accuracyTestActive = false;
   window.clearInterval(accuracyTestTimer);
   accuracyTestTimer = null;
-  startAccuracyTestButton.disabled = false;
-  stopAccuracyTestButton.disabled = true;
-  exportAccuracyCsvButton.disabled = accuracyTestRows.length === 0;
   summarizeAccuracyTest();
+  accuracySummaryReadout.textContent = `Test stopped\n${accuracySummaryReadout.textContent}`;
+  updateAccuracyButtonStates();
   screen("accuracy test stopped");
 }
 
 function clearAccuracyLog() {
   accuracyTestRows = [];
   pendingAccuracyMarkers = [];
-  exportAccuracyCsvButton.disabled = true;
-  accuracySummaryReadout.textContent = "Test log cleared.";
+  updateAccuracyButtonStates();
+  showTestConfirmation("Test log cleared");
   screen("accuracy test log cleared");
 }
 
@@ -1085,6 +1223,7 @@ function exportAccuracyCsv() {
   link.click();
   link.remove();
   URL.revokeObjectURL(url);
+  showTestConfirmation(`CSV exported\n${accuracyTestRows.length} rows`);
   screen(`accuracy CSV exported: ${accuracyTestRows.length} rows`);
 }
 
@@ -1094,6 +1233,8 @@ function addAccuracyMarker(marker) {
     return;
   }
   accuracyTestRows.push(currentAccuracyRow(marker));
+  updateAccuracyButtonStates();
+  showTestConfirmation(`Marker added: ${marker}`);
   screen(`accuracy marker: ${marker}`);
 }
 
@@ -3031,162 +3172,161 @@ function validateDomReferences() {
   }
 }
 
-startButton.addEventListener("click", startListening);
-stopButton.addEventListener("click", stopListening);
-tapButton.addEventListener("click", tapTempo);
-calibrateButton.addEventListener("click", tapTempoCalibrate);
-clapModeButton.addEventListener("click", toggleClapMode);
-lockButton.addEventListener("click", toggleLock);
-fullscreenButton.addEventListener("click", toggleFullscreen);
-openSetlistButton.addEventListener("click", () => openPanel("setlist"));
-closeSetlistButton.addEventListener("click", closePanels);
-openSettingsButton.addEventListener("click", () => openPanel("settings"));
-closeSettingsButton.addEventListener("click", closePanels);
-previousSongButton.addEventListener("pointerdown", (event) => handleNavPointer(event, -1, "Prev", previousSongButton));
-nextSongButton.addEventListener("pointerdown", (event) => handleNavPointer(event, 1, "Next", nextSongButton));
-previousSongButton.addEventListener("pointerup", (event) => {
-  event.preventDefault();
-  event.stopPropagation();
-});
-nextSongButton.addEventListener("pointerup", (event) => {
-  event.preventDefault();
-  event.stopPropagation();
-});
-previousSongButton.addEventListener("pointercancel", () => previousSongButton.classList.remove("pressed"));
-nextSongButton.addEventListener("pointercancel", () => nextSongButton.classList.remove("pressed"));
-previousSongButton.addEventListener("click", (event) => handleNavClick(event, -1, "Prev", previousSongButton));
-nextSongButton.addEventListener("click", (event) => handleNavClick(event, 1, "Next", nextSongButton));
-songForm.addEventListener("submit", addSong);
-importCsvButton.addEventListener("click", () => importCsvInput.click());
-importCsvInput.addEventListener("change", () => {
-  importCsvFile(importCsvInput.files[0]);
-  importCsvInput.value = "";
-});
-debugModeSelect.addEventListener("change", applyDebugMode);
-startAccuracyTestButton.addEventListener("click", startAccuracyTest);
-stopAccuracyTestButton.addEventListener("click", stopAccuracyTest);
-exportAccuracyCsvButton.addEventListener("click", exportAccuracyCsv);
-clearAccuracyLogButton.addEventListener("click", clearAccuracyLog);
-markerButtons.forEach((button) => {
-  button.addEventListener("click", () => addAccuracyMarker(button.dataset.marker));
-});
-targetAnchoringSelect.addEventListener("change", () => {
-  try {
-    localStorage.setItem(TARGET_ANCHORING_KEY, targetAnchoringSelect.value);
-  } catch (error) {
-    setStatus("Target anchoring changed");
-  }
-  candidateHistory = [];
-  fastCandidate = null;
-  stableLockTime = null;
-  stableLockReadout.textContent = "--";
-  setTempoState(smoothedBpm ? "reacquiring" : "acquiring");
-  screen(`target anchoring changed: ${targetAnchoringSelect.value}`);
-});
-tempoToleranceInput.addEventListener("change", () => {
-  try {
-    localStorage.setItem(TEMPO_TOLERANCE_KEY, tempoToleranceInput.value);
-  } catch (error) {
-    setStatus("Tempo tolerance changed");
-  }
-  updatePerformanceDisplay();
-});
-performanceTapZone.addEventListener("click", (event) => {
-  if (event.target.closest(".nav-button")) {
-    return;
-  }
-  if (event.detail > 1) {
-    return;
-  }
-  window.clearTimeout(performanceTapTimer);
-  performanceTapTimer = window.setTimeout(toggleListeningFromPerformance, 220);
-});
-performanceTapZone.addEventListener("dblclick", () => {
-  window.clearTimeout(performanceTapTimer);
-  toggleFullscreen();
-});
-stage.addEventListener("pointerdown", (event) => {
-  swipeStartedOnNav = Boolean(event.target.closest(".nav-button"));
-  if (swipeStartedOnNav) {
-    return;
-  }
-  swipePointerId = event.pointerId;
-  pointerStartX = event.clientX;
-  pointerStartY = event.clientY;
-});
-stage.addEventListener("pointerup", (event) => {
-  if (swipeStartedOnNav || swipePointerId !== event.pointerId) {
+function attachEventHandlers() {
+  attachReliableButton(openSetlistButton, "Open Setlist", () => openPanel("setlist"));
+  attachReliableButton(closeSetlistButton, "Close Setlist", closePanels);
+  attachReliableButton(openSettingsButton, "Open Settings", () => openPanel("settings"));
+  attachSettingsButtonHandlers();
+
+  previousSongButton.addEventListener("pointerdown", (event) => handleNavPointer(event, -1, "Prev", previousSongButton));
+  nextSongButton.addEventListener("pointerdown", (event) => handleNavPointer(event, 1, "Next", nextSongButton));
+  previousSongButton.addEventListener("pointerup", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  nextSongButton.addEventListener("pointerup", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  previousSongButton.addEventListener("pointercancel", () => previousSongButton.classList.remove("pressed"));
+  nextSongButton.addEventListener("pointercancel", () => nextSongButton.classList.remove("pressed"));
+  previousSongButton.addEventListener("click", (event) => handleNavClick(event, -1, "Prev", previousSongButton));
+  nextSongButton.addEventListener("click", (event) => handleNavClick(event, 1, "Next", nextSongButton));
+  songForm.addEventListener("submit", addSong);
+  importCsvButton.addEventListener("click", () => importCsvInput.click());
+  importCsvInput.addEventListener("change", () => {
+    importCsvFile(importCsvInput.files[0]);
+    importCsvInput.value = "";
+  });
+  debugModeSelect.addEventListener("change", applyDebugMode);
+  targetAnchoringSelect.addEventListener("change", () => {
+    try {
+      localStorage.setItem(TARGET_ANCHORING_KEY, targetAnchoringSelect.value);
+    } catch (error) {
+      setStatus("Target anchoring changed");
+    }
+    candidateHistory = [];
+    fastCandidate = null;
+    stableLockTime = null;
+    stableLockReadout.textContent = "--";
+    setTempoState(smoothedBpm ? "reacquiring" : "acquiring");
+    screen(`target anchoring changed: ${targetAnchoringSelect.value}`);
+  });
+  tempoToleranceInput.addEventListener("change", () => {
+    try {
+      localStorage.setItem(TEMPO_TOLERANCE_KEY, tempoToleranceInput.value);
+    } catch (error) {
+      setStatus("Tempo tolerance changed");
+    }
+    updatePerformanceDisplay();
+  });
+  performanceTapZone.addEventListener("click", (event) => {
+    if (event.target.closest(".nav-button")) {
+      return;
+    }
+    if (event.detail > 1) {
+      return;
+    }
+    window.clearTimeout(performanceTapTimer);
+    performanceTapTimer = window.setTimeout(toggleListeningFromPerformance, 220);
+  });
+  performanceTapZone.addEventListener("dblclick", () => {
+    window.clearTimeout(performanceTapTimer);
+    toggleFullscreen();
+  });
+  stage.addEventListener("pointerdown", (event) => {
+    swipeStartedOnNav = Boolean(event.target.closest(".nav-button"));
+    if (swipeStartedOnNav) {
+      return;
+    }
+    swipePointerId = event.pointerId;
+    pointerStartX = event.clientX;
+    pointerStartY = event.clientY;
+  });
+  stage.addEventListener("pointerup", (event) => {
+    if (swipeStartedOnNav || swipePointerId !== event.pointerId) {
+      swipePointerId = null;
+      swipeStartedOnNav = false;
+      return;
+    }
+
+    const dx = event.clientX - pointerStartX;
+    const dy = event.clientY - pointerStartY;
+    swipePointerId = null;
+    if (Math.abs(dx) > 56 && Math.abs(dx) > Math.abs(dy) * 1.45) {
+      navigateSong(dx < 0 ? 1 : -1, dx < 0 ? "Next swipe" : "Prev swipe", dx < 0 ? nextSongButton : previousSongButton);
+    }
+  });
+  stage.addEventListener("pointercancel", () => {
     swipePointerId = null;
     swipeStartedOnNav = false;
-    return;
-  }
+  });
+  refractorySlider.addEventListener("input", () => {
+    refractoryReadout.textContent = `${getRefractoryMs()}ms`;
+  });
+  orientationSelect.addEventListener("change", (event) => applyOrientation(event.target.value));
+  portraitFillSelect.addEventListener("change", (event) => {
+    try {
+      localStorage.setItem(PORTRAIT_FILL_KEY, event.target.value);
+    } catch (error) {
+      setStatus("Portrait fill changed");
+    }
+    updatePortraitScale();
+  });
+  minBpmInput.addEventListener("change", () => {
+    const { min, max } = getBpmRange();
+    minBpmInput.value = String(min);
+    maxBpmInput.value = String(max);
+    rangePresetSelect.value = "custom";
+  });
+  maxBpmInput.addEventListener("change", () => {
+    const { min, max } = getBpmRange();
+    minBpmInput.value = String(min);
+    maxBpmInput.value = String(max);
+    rangePresetSelect.value = "custom";
+  });
+  rangePresetSelect.addEventListener("change", applyRangePreset);
+  targetBpmInput.addEventListener("change", () => {
+    const target = getTargetBpm();
+    if (!target) {
+      selectionReasonReadout.textContent = "--";
+      targetErrorReadout.textContent = "--";
+      screen("target BPM assist cleared");
+      return;
+    }
 
-  const dx = event.clientX - pointerStartX;
-  const dy = event.clientY - pointerStartY;
-  swipePointerId = null;
-  if (Math.abs(dx) > 56 && Math.abs(dx) > Math.abs(dy) * 1.45) {
-    navigateSong(dx < 0 ? 1 : -1, dx < 0 ? "Next swipe" : "Prev swipe", dx < 0 ? nextSongButton : previousSongButton);
-  }
-});
-stage.addEventListener("pointercancel", () => {
-  swipePointerId = null;
-  swipeStartedOnNav = false;
-});
-refractorySlider.addEventListener("input", () => {
-  refractoryReadout.textContent = `${getRefractoryMs()}ms`;
-});
-orientationSelect.addEventListener("change", (event) => applyOrientation(event.target.value));
-portraitFillSelect.addEventListener("change", (event) => {
-  try {
-    localStorage.setItem(PORTRAIT_FILL_KEY, event.target.value);
-  } catch (error) {
-    setStatus("Portrait fill changed");
-  }
-  updatePortraitScale();
-});
-minBpmInput.addEventListener("change", () => {
-  const { min, max } = getBpmRange();
-  minBpmInput.value = String(min);
-  maxBpmInput.value = String(max);
-  rangePresetSelect.value = "custom";
-});
-maxBpmInput.addEventListener("change", () => {
-  const { min, max } = getBpmRange();
-  minBpmInput.value = String(min);
-  maxBpmInput.value = String(max);
-  rangePresetSelect.value = "custom";
-});
-rangePresetSelect.addEventListener("change", applyRangePreset);
-targetBpmInput.addEventListener("change", () => {
-  const target = getTargetBpm();
-  if (!target) {
-    selectionReasonReadout.textContent = "--";
-    targetErrorReadout.textContent = "--";
-    screen("target BPM assist cleared");
-    return;
-  }
+    screen(`target BPM assist set for debug only: ${Math.round(target)} BPM`);
+  });
+  lockSpeedSelect.addEventListener("change", () => {
+    candidateHistory = [];
+    fastCandidate = null;
+    stableLockTime = null;
+    stableLockReadout.textContent = "--";
+    setTempoState(smoothedBpm ? "reacquiring" : "acquiring");
+    screen(`lock speed changed: ${lockSpeedSelect.value}`);
+  });
+  document.addEventListener("fullscreenchange", () => {
+    fullscreenButton.textContent = document.fullscreenElement ? "Exit Fullscreen" : "Fullscreen";
+    updatePortraitScale();
+  });
+  window.addEventListener("resize", updatePortraitScale);
+  window.addEventListener("orientationchange", () => window.setTimeout(updatePortraitScale, 250));
+}
 
-  screen(`target BPM assist set for debug only: ${Math.round(target)} BPM`);
-});
-lockSpeedSelect.addEventListener("change", () => {
-  candidateHistory = [];
-  fastCandidate = null;
-  stableLockTime = null;
-  stableLockReadout.textContent = "--";
-  setTempoState(smoothedBpm ? "reacquiring" : "acquiring");
-  screen(`lock speed changed: ${lockSpeedSelect.value}`);
-});
-document.addEventListener("fullscreenchange", () => {
-  fullscreenButton.textContent = document.fullscreenElement ? "Exit Fullscreen" : "Fullscreen";
-  updatePortraitScale();
-});
-window.addEventListener("resize", updatePortraitScale);
-window.addEventListener("orientationchange", () => window.setTimeout(updatePortraitScale, 250));
+function initApp() {
+  initOrientation();
+  initUiState();
+  validateDomReferences();
+  attachEventHandlers();
+  updateAccuracyButtonStates();
+  renderBpm(null);
+  updateTempoReadouts(null, null, 0);
+  setMode("no signal");
+  updateMicStateIndicator();
+}
 
-initOrientation();
-initUiState();
-validateDomReferences();
-renderBpm(null);
-updateTempoReadouts(null, null, 0);
-setMode("no signal");
-updateMicStateIndicator();
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initApp, { once: true });
+} else {
+  initApp();
+}
