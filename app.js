@@ -42,14 +42,21 @@ const selectedBpmReadout = document.getElementById("selectedBpmReadout");
 const selectionReasonReadout = document.getElementById("selectionReasonReadout");
 const targetErrorReadout = document.getElementById("targetErrorReadout");
 const topCandidatesReadout = document.getElementById("topCandidatesReadout");
+const rawEstimatorBpmReadout = document.getElementById("rawEstimatorBpmReadout");
+const onsetBpmReadout = document.getElementById("onsetBpmReadout");
 const multiBandBpmReadout = document.getElementById("multiBandBpmReadout");
 const spectralBpmReadout = document.getElementById("spectralBpmReadout");
 const targetAnchorBpmReadout = document.getElementById("targetAnchorBpmReadout");
+const targetAssistedBpmReadout = document.getElementById("targetAssistedBpmReadout");
+const finalDisplayBpmReadout = document.getElementById("finalDisplayBpmReadout");
+const estimatorAgreementReadout = document.getElementById("estimatorAgreementReadout");
 const consensusReadout = document.getElementById("consensusReadout");
 const fastEstimateReadout = document.getElementById("fastEstimateReadout");
 const stableCandidateReadout = document.getElementById("stableCandidateReadout");
 const displaySourceReadout = document.getElementById("displaySourceReadout");
 const mixDensityReadout = document.getElementById("mixDensityReadout");
+const lowBandEnergyReadout = document.getElementById("lowBandEnergyReadout");
+const lowBandFluxReadout = document.getElementById("lowBandFluxReadout");
 const kickConfidenceReadout = document.getElementById("kickConfidenceReadout");
 const snareConfidenceReadout = document.getElementById("snareConfidenceReadout");
 const rejectionReadout = document.getElementById("rejectionReadout");
@@ -154,6 +161,8 @@ let strengthHistory = [];
 let levelHistory = [];
 let kickStrengthHistory = [];
 let midStrengthHistory = [];
+let lowBandEnergy = 0;
+let lowBandFlux = 0;
 let pendingCluster = null;
 let screenLogTimer = 0;
 let autoThresholdMultiplier = 1;
@@ -176,6 +185,12 @@ let kickConfidence = 0;
 let currentStableCandidate = null;
 let snareConfidence = 0;
 let highBandConfidence = 0;
+let estimatorAgreement = 0;
+let rawEstimatorBpm = null;
+let onsetEstimatorBpm = null;
+let spectralEstimatorBpm = null;
+let targetAssistedBpm = null;
+let finalDisplayBpm = null;
 let mixDensity = 0;
 let rejectedHighNoiseCount = 0;
 let onsetEventHistory = [];
@@ -815,6 +830,8 @@ function updateLevelDisplay() {
   levelReadout.textContent = avgLevel.toFixed(3);
   thresholdReadout.textContent = currentThreshold.toFixed(3);
   mixDensityReadout.textContent = `${Math.round(mixDensity * 100)}%`;
+  lowBandEnergyReadout.textContent = lowBandEnergy.toFixed(4);
+  lowBandFluxReadout.textContent = lowBandFlux.toFixed(4);
   kickConfidenceReadout.textContent = `${Math.round(kickConfidence * 100)}%`;
   snareConfidenceReadout.textContent = `${Math.round(snareConfidence * 100)}%`;
   rejectionReadout.textContent = String(rejectedHighNoiseCount);
@@ -896,7 +913,7 @@ function inferSelectedEstimator() {
 
 function currentAccuracyRow(marker = "") {
   const target = getAccuracyTargetBpm();
-  const finalBpm = smoothedBpm ? Number(smoothedBpm.toFixed(2)) : null;
+  const finalBpm = finalDisplayBpm ? Number(finalDisplayBpm.toFixed(2)) : smoothedBpm ? Number(smoothedBpm.toFixed(2)) : null;
   const rawBpm = parseReadoutNumber(rawBpmReadout.textContent);
   const confidence = parseReadoutNumber(confidenceReadout.textContent) || 0;
   return {
@@ -905,18 +922,25 @@ function currentAccuracyRow(marker = "") {
     song_name: testSongNameInput.value.trim(),
     test_notes: testNotesInput.value.trim(),
     marker,
-    raw_detected_bpm: rawBpm,
+    raw_detected_bpm: rawEstimatorBpm || rawBpm,
+    raw_estimator_bpm: rawEstimatorBpm,
+    spectral_bpm: spectralEstimatorBpm,
+    onset_bpm: onsetEstimatorBpm,
+    target_assisted_bpm: targetAssistedBpm,
     final_displayed_bpm: finalBpm,
     target_bpm: target,
     error_from_target: target && finalBpm ? Number((finalBpm - target).toFixed(2)) : null,
     confidence,
     state: listening ? tempoState : "stopped",
     selected_estimator: inferSelectedEstimator(),
+    estimator_agreement: estimatorAgreement,
     top_5_candidates: topCandidatesReadout.textContent,
     onset_count: beatCount,
     raw_onset_count: rawOnsetCount,
     rejected_onset_count: rejectedHighNoiseCount,
     mix_density: Number(mixDensity.toFixed(3)),
+    low_band_energy: Number(lowBandEnergy.toFixed(5)),
+    low_band_flux: Number(lowBandFlux.toFixed(5)),
     low_band_confidence: Number(kickConfidence.toFixed(3)),
     mid_band_confidence: Number(snareConfidence.toFixed(3)),
     high_band_confidence: Number(highBandConfidence.toFixed(3))
@@ -1136,6 +1160,8 @@ function updateDisplayedBpm(correctedBpm, confidence, source) {
   }
 
   renderBpm(smoothedBpm);
+  finalDisplayBpm = smoothedBpm;
+  finalDisplayBpmReadout.textContent = String(Math.round(finalDisplayBpm));
   displaySourceReadout.textContent = source === "manual" ? "Manual Lock" : source === "stable" ? "Stable" : source === "fast" ? "Fast" : "Corrected";
   setStatus(source === "manual" ? "Manual tempo calibrated" : tempoStateReadout.textContent);
   screen(`selected BPM: ${Math.round(correctedBpm)} (${Math.round(confidence)}%)`);
@@ -1703,7 +1729,8 @@ function buildTempoConsensus(enrichedScores, now, fastHistogram) {
   const spectralCandidates = spectralAutocorrelationCandidates(now);
   const target = getTargetAnchorBpm();
   const anchor = targetAnchorStrength();
-  const multiBandCandidate = enrichedScores[0] || null;
+  const rawGridCandidate = [...enrichedScores].sort((a, b) => b.score - a.score)[0] || null;
+  const multiBandCandidate = rawGridCandidate;
   const kickCandidate = [...enrichedScores]
     .filter((candidate) => candidate.kickScore > 0 || candidate.kickReliability > 0)
     .sort((a, b) => ((b.kickScore || 0) + (b.kickReliability || 0)) - ((a.kickScore || 0) + (a.kickReliability || 0)))[0] || null;
@@ -1711,6 +1738,11 @@ function buildTempoConsensus(enrichedScores, now, fastHistogram) {
   const intervalCandidate = fastHistogram[0] || null;
   const targetCandidate = findTargetAnchoredCandidate(enrichedScores, spectralCandidates, fastHistogram);
   const votes = [];
+
+  rawEstimatorBpm = rawGridCandidate?.bpm || null;
+  onsetEstimatorBpm = intervalCandidate?.bpm || multiBandCandidate?.bpm || null;
+  spectralEstimatorBpm = spectralCandidate?.bpm || null;
+  targetAssistedBpm = targetCandidate?.bpm || (target ? target : null);
 
   function addVote(name, candidate, weight, confidence = null) {
     if (!candidate || !candidate.bpm) {
@@ -1758,13 +1790,17 @@ function buildTempoConsensus(enrichedScores, now, fastHistogram) {
     const lowMid = Math.max(candidate.kickReliability || 0, candidate.snareReliability || 0);
     const phase = candidate.phaseAgreement || 0;
     const consensusScore = (candidate.combinedScore * 0.42 + voteScore * 0.38 + stability * 0.1 + lowMid * 0.06 + phase * 0.04) * targetFactor;
-    const consensusConfidence = Math.min(100, Math.round(
+    const estimatorConflict = target && targetAssistedBpm && rawEstimatorBpm
+      ? Math.min(1, Math.abs(rawEstimatorBpm - targetAssistedBpm) / Math.max(8, anchor.range))
+      : 0;
+    const consensusConfidence = Math.min(100, Math.max(0, Math.round(
       (candidate.confidence || 0) * 0.36
       + Math.min(1, voteScore) * 31
-      + Math.min(1, agreement / 3) * 18
+      + Math.min(1, agreement / 3) * 22
       + lowMid * 10
       + (target && targetDistance <= anchor.range ? 10 : 0)
-    ));
+      - estimatorConflict * 18
+    )));
 
     return {
       ...candidate,
@@ -1796,7 +1832,12 @@ function buildTempoConsensus(enrichedScores, now, fastHistogram) {
   multiBandBpmReadout.textContent = multiBandCandidate ? `${Math.round(multiBandCandidate.bpm)} (${Math.round(multiBandCandidate.confidence || 0)}%)` : "--";
   spectralBpmReadout.textContent = spectralCandidate ? `${Math.round(spectralCandidate.bpm)} (${Math.round(spectralCandidate.confidence || 0)}%)` : "--";
   targetAnchorBpmReadout.textContent = targetCandidate ? `${Math.round(targetCandidate.bpm)} (${Math.round(targetCandidate.confidence || 0)}%)` : target ? `${Math.round(target)} (anchor)` : "--";
+  rawEstimatorBpmReadout.textContent = rawEstimatorBpm ? String(Math.round(rawEstimatorBpm)) : "--";
+  onsetBpmReadout.textContent = onsetEstimatorBpm ? String(Math.round(onsetEstimatorBpm)) : "--";
+  targetAssistedBpmReadout.textContent = targetAssistedBpm ? String(Math.round(targetAssistedBpm)) : "--";
   consensusReadout.textContent = selected ? `${Math.round(selected.bpm)} (${selected.consensusConfidence}%, ${selected.matchingEstimators?.join("+") || "grid"})` : "--";
+  estimatorAgreement = selected?.estimatorAgreement || 0;
+  estimatorAgreementReadout.textContent = selected ? `${estimatorAgreement} estimators` : "--";
 
   return {
     selected,
@@ -1858,7 +1899,14 @@ function updateFastEstimate(now) {
     }
   }
 
-  const prediction = predictionScore(best.bpm, now);
+  let prediction = predictionScore(best.bpm, now);
+  if (anchorTarget && Math.abs(best.bpm - anchorTarget) > 5) {
+    const targetPrediction = predictionScore(anchorTarget, now);
+    if (targetPrediction.confidence >= Math.max(0.42, prediction.confidence * 0.72)) {
+      best = { bpm: anchorTarget, score: best.score * (0.88 + targetPrediction.confidence * 0.24), targetAssisted: true };
+      prediction = targetPrediction;
+    }
+  }
   predictionHits = prediction.hits;
   predictionMisses = prediction.misses;
   predictedBeat = beatHistory.length ? beatHistory[beatHistory.length - 1].time + 60000 / best.bpm : null;
@@ -1884,8 +1932,10 @@ function updateFastEstimate(now) {
     }
     updateCandidateReadouts({ bpm: best.bpm, score: best.score }, null, null, { bpm: corrected, score: best.score });
     updateTempoReadouts(best.bpm, corrected, fastConfidence);
-    selectionReasonReadout.textContent = `fast interval histogram; predicted beat hits ${prediction.hits}/${prediction.hits + prediction.misses}`;
-    switchReasonReadout.textContent = "fast acquisition candidate";
+    selectionReasonReadout.textContent = best.targetAssisted
+      ? `fast target grid; predicted beat hits ${prediction.hits}/${prediction.hits + prediction.misses}`
+      : `fast interval histogram; predicted beat hits ${prediction.hits}/${prediction.hits + prediction.misses}`;
+    switchReasonReadout.textContent = best.targetAssisted ? "fast target-grid candidate" : "fast acquisition candidate";
     setTempoState("acquiring");
     updateDisplayedBpm(corrected, fastConfidence, "fast");
     screen(`fast estimate ${Math.round(corrected)} BPM: hits ${prediction.hits}, misses ${prediction.misses}`);
@@ -1904,7 +1954,8 @@ function withConfidence(score, allScores) {
   const coverageTarget = tempoState === "stable" ? 10 : 4;
   const coverage = Math.min(1, score.count / coverageTarget);
   const alignment = score.aligned / score.count;
-  const confidence = Math.min(100, Math.round((score.score * 0.42 + separation * 0.2 + alignment * 0.26 + coverage * 0.12) * 100));
+  const agreementBoost = Math.min(0.14, (score.estimatorAgreement || 0) * 0.04);
+  const confidence = Math.min(100, Math.round((score.score * 0.38 + separation * 0.17 + alignment * 0.25 + coverage * 0.1 + agreementBoost) * 100));
   return { ...score, confidence };
 }
 
@@ -2163,7 +2214,9 @@ function estimateTempo(now, source) {
         setTempoState("holding");
         holdStartTime = holdStartTime || now;
         expectedBpm = lastStableBpm || targetAnchor || expectedBpm;
-        renderBpm(lastStableBpm || smoothedBpm || targetAnchor);
+        finalDisplayBpm = lastStableBpm || smoothedBpm || targetAnchor;
+        renderBpm(finalDisplayBpm);
+        finalDisplayBpmReadout.textContent = String(Math.round(finalDisplayBpm));
         displaySourceReadout.textContent = "Stable";
         lockReason = `holding ${Math.round(lastStableBpm || smoothedBpm || targetAnchor)} BPM; target ${targetAnchor ? Math.round(targetAnchor) : "--"}, phase ${Math.round(phase.agreement * 100)}%, disagreement ${disagreementBeats}/${disagreementLimit}`;
         switchReasonReadout.textContent = lockReason;
@@ -2306,6 +2359,8 @@ function handleFrame(frame) {
 
   const kickFlux = bandFluxes[0];
   const midFlux = bandFluxes[1];
+  lowBandEnergy = bands[0] || 0;
+  lowBandFlux = kickFlux;
   kickStrengthHistory.push(kickFlux);
   midStrengthHistory.push(midFlux);
   if (kickStrengthHistory.length > 90) {
@@ -2321,10 +2376,17 @@ function handleFrame(frame) {
     : 0;
   highBandConfidence = highBandConfidence * 0.82 + highActivity * 0.18;
 
-  const kickThreshold = Math.max(getNoiseFloor() * 0.9, median(kickStrengthHistory) + mean(kickStrengthHistory) * 1.05);
+  const kickMedian = median(kickStrengthHistory);
+  const kickMean = mean(kickStrengthHistory);
+  const kickThreshold = Math.max(getNoiseFloor() * 0.35, kickMedian + kickMean * 0.52);
   const midThreshold = Math.max(getNoiseFloor() * 0.75, median(midStrengthHistory) + mean(midStrengthHistory) * 1.15);
-  if (kickStrengthHistory.length > 8 && kickFlux > kickThreshold && bands[0] > avgLevel * 0.18) {
-    registerBandBeat("kick", now, kickFlux * 1.6);
+  const lowPulseActivity = kickStrengthHistory.length
+    ? kickStrengthHistory.filter((value) => value > kickThreshold).length / kickStrengthHistory.length
+    : 0;
+  const relativeLowRise = kickMean > 0 ? kickFlux / kickMean : 0;
+  kickConfidence = Math.max(kickConfidence * 0.94, Math.min(1, lowPulseActivity * 0.58 + Math.min(1, relativeLowRise / 3) * 0.22));
+  if (kickStrengthHistory.length > 6 && kickFlux > kickThreshold && (lowBandEnergy > getNoiseFloor() * 0.55 || relativeLowRise > 1.65)) {
+    registerBandBeat("kick", now, Math.max(kickFlux * 2.2, lowBandEnergy * 0.55));
   }
   if (midStrengthHistory.length > 8 && midFlux > midThreshold) {
     registerBandBeat("mid", now, midFlux);
@@ -2381,6 +2443,8 @@ function resetDetectionState() {
   previousBandEnergies = [0, 0, 0];
   bandFluxHistory = [[], [], []];
   spectralFluxHistory = [];
+  lowBandEnergy = 0;
+  lowBandFlux = 0;
   onsetStrength = 0;
   currentThreshold = 0;
   lastGroupedBeatTime = 0;
@@ -2397,6 +2461,12 @@ function resetDetectionState() {
   currentStableCandidate = null;
   snareConfidence = 0;
   highBandConfidence = 0;
+  estimatorAgreement = 0;
+  rawEstimatorBpm = null;
+  onsetEstimatorBpm = null;
+  spectralEstimatorBpm = null;
+  targetAssistedBpm = null;
+  finalDisplayBpm = null;
   mixDensity = 0;
   rejectedHighNoiseCount = 0;
   onsetEventHistory = [];
@@ -2431,14 +2501,21 @@ function resetDetectionState() {
   selectionReasonReadout.textContent = "--";
   targetErrorReadout.textContent = "--";
   topCandidatesReadout.textContent = "--";
+  rawEstimatorBpmReadout.textContent = "--";
+  onsetBpmReadout.textContent = "--";
   multiBandBpmReadout.textContent = "--";
   spectralBpmReadout.textContent = "--";
   targetAnchorBpmReadout.textContent = "--";
+  targetAssistedBpmReadout.textContent = "--";
+  finalDisplayBpmReadout.textContent = "--";
+  estimatorAgreementReadout.textContent = "--";
   consensusReadout.textContent = "--";
   fastEstimateReadout.textContent = "--";
   stableCandidateReadout.textContent = "--";
   displaySourceReadout.textContent = "--";
   mixDensityReadout.textContent = "0%";
+  lowBandEnergyReadout.textContent = "0.0000";
+  lowBandFluxReadout.textContent = "0.0000";
   kickConfidenceReadout.textContent = "0%";
   snareConfidenceReadout.textContent = "0%";
   rejectionReadout.textContent = "0";
@@ -2888,14 +2965,21 @@ function validateDomReferences() {
     "lockSpeedSelect",
     "topCandidatesReadout",
     "selectionReasonReadout",
+    "rawEstimatorBpmReadout",
+    "onsetBpmReadout",
     "multiBandBpmReadout",
     "spectralBpmReadout",
     "targetAnchorBpmReadout",
+    "targetAssistedBpmReadout",
+    "finalDisplayBpmReadout",
+    "estimatorAgreementReadout",
     "consensusReadout",
     "fastEstimateReadout",
     "stableCandidateReadout",
     "displaySourceReadout",
     "mixDensityReadout",
+    "lowBandEnergyReadout",
+    "lowBandFluxReadout",
     "kickConfidenceReadout",
     "snareConfidenceReadout",
     "rejectionReadout",
