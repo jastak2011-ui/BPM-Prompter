@@ -50,6 +50,9 @@ const targetAnchorBpmReadout = document.getElementById("targetAnchorBpmReadout")
 const targetAssistedBpmReadout = document.getElementById("targetAssistedBpmReadout");
 const finalDisplayBpmReadout = document.getElementById("finalDisplayBpmReadout");
 const estimatorAgreementReadout = document.getElementById("estimatorAgreementReadout");
+const detectedBpmAvailableReadout = document.getElementById("detectedBpmAvailableReadout");
+const anchorOnlyReadout = document.getElementById("anchorOnlyReadout");
+const candidateRejectionReadout = document.getElementById("candidateRejectionReadout");
 const consensusReadout = document.getElementById("consensusReadout");
 const fastEstimateReadout = document.getElementById("fastEstimateReadout");
 const stableCandidateReadout = document.getElementById("stableCandidateReadout");
@@ -193,6 +196,10 @@ let targetAssistedBpm = null;
 let finalDisplayBpm = null;
 let lastEstimatorUpdateTime = 0;
 let lastDisplayUpdateTime = 0;
+let detectedBpmAvailable = false;
+let anchorOnlyDisplay = false;
+let displaySourceLabel = "--";
+let candidateRejectionReason = "--";
 let mixDensity = 0;
 let rejectedHighNoiseCount = 0;
 let onsetEventHistory = [];
@@ -1008,19 +1015,71 @@ function getAccuracyTargetBpm() {
 }
 
 function inferSelectedEstimator() {
-  const source = displaySourceReadout.textContent.toLowerCase();
-  const reason = selectionReasonReadout.textContent.toLowerCase();
-  const consensus = consensusReadout.textContent.toLowerCase();
-  if (tempoState === "holding" || source.includes("stable") && lastStatusMessage === "Holding BPM") {
+  const source = displaySourceLabel.toLowerCase();
+  if (source.includes("holding")) {
     return "held";
   }
-  if (reason.includes("target") || consensus.includes("target")) {
+  if (source.includes("target")) {
     return "target anchored";
   }
-  if (reason.includes("spectral") || consensus.includes("spectral")) {
+  if (source.includes("spectral")) {
     return "spectral";
   }
+  if (source.includes("consensus")) {
+    return "consensus";
+  }
   return "onset";
+}
+
+function hasDetectedBpmEvidence(maxAgeMs = 1800) {
+  const fresh = performance.now() - lastEstimatorUpdateTime <= maxAgeMs;
+  return Boolean(fresh && (
+    rawEstimatorBpm
+    || spectralEstimatorBpm
+    || onsetEstimatorBpm
+    || estimatorAgreement > 0
+  ));
+}
+
+function updateDetectionAvailabilityReadouts() {
+  detectedBpmAvailable = hasDetectedBpmEvidence();
+  anchorOnlyDisplay = Boolean(finalDisplayBpm && displaySourceLabel === "Target Anchor" && !detectedBpmAvailable);
+  detectedBpmAvailableReadout.textContent = String(detectedBpmAvailable);
+  anchorOnlyReadout.textContent = String(anchorOnlyDisplay);
+  candidateRejectionReadout.textContent = candidateRejectionReason;
+}
+
+function setDisplaySource(label) {
+  displaySourceLabel = label;
+  displaySourceReadout.textContent = label;
+  updateDetectionAvailabilityReadouts();
+}
+
+function candidateRejectionFor(candidate, target = getTargetAnchorBpm()) {
+  if (!candidate || !target) {
+    return "insufficient beat-grid support";
+  }
+
+  const bpm = candidate.bpm;
+  const ratio = bpm / target;
+  if (Math.abs(bpm - target * 2) <= Math.max(4, target * 0.04)) {
+    return "double-time";
+  }
+  if (
+    Math.abs(ratio - 1.5) <= 0.07
+    || Math.abs(ratio - 1.75) <= 0.08
+    || Math.abs(ratio - 5 / 3) <= 0.08
+    || Math.abs(ratio - 7 / 4) <= 0.08
+  ) {
+    return "harmonic";
+  }
+  if (bpm > target * 1.45 || bpm < target * 0.62) {
+    return "subdivision";
+  }
+  if ((candidate.aligned || 0) < 3 || (candidate.estimatorAgreement || 0) < 1) {
+    return "insufficient beat-grid support";
+  }
+  return "accepted";
 }
 
 function currentAccuracyRow(marker = "") {
@@ -1041,14 +1100,18 @@ function currentAccuracyRow(marker = "") {
     raw_estimator_bpm: estimatorFresh ? rawEstimatorBpm : null,
     spectral_bpm: estimatorFresh ? spectralEstimatorBpm : null,
     onset_bpm: estimatorFresh ? onsetEstimatorBpm : null,
-    target_assisted_bpm: estimatorFresh ? targetAssistedBpm : null,
+    target_assisted_bpm: displaySourceLabel === "Target Anchor" ? target : estimatorFresh ? targetAssistedBpm : null,
     final_displayed_bpm: finalBpm,
     target_bpm: target,
     error_from_target: target && finalBpm ? Number((finalBpm - target).toFixed(2)) : null,
     confidence,
     state: listening ? tempoState : "stopped",
+    display_source: displayFresh ? displaySourceLabel : "none",
     selected_estimator: displayFresh ? inferSelectedEstimator() : "none",
     estimator_agreement: estimatorFresh ? estimatorAgreement : 0,
+    detected_bpm_available: estimatorFresh ? detectedBpmAvailable : false,
+    anchor_only: displayFresh ? anchorOnlyDisplay : false,
+    candidate_rejection_reason: estimatorFresh ? candidateRejectionReason : "--",
     top_5_candidates: estimatorFresh ? topCandidatesReadout.textContent : "--",
     frames_processed: framesProcessed,
     estimator_fresh: estimatorFresh,
@@ -1180,6 +1243,10 @@ function startAccuracyTest() {
     spectralEstimatorBpm = null;
     targetAssistedBpm = null;
     estimatorAgreement = 0;
+    detectedBpmAvailable = false;
+    anchorOnlyDisplay = false;
+    displaySourceLabel = "--";
+    candidateRejectionReason = "--";
   }
   accuracyTestActive = true;
   showTestConfirmation("Test started");
@@ -1277,7 +1344,7 @@ function triggerBeatFlash() {
 function updateDisplayedBpm(correctedBpm, confidence, source) {
   if (locked) {
     setStatus("BPM locked");
-    displaySourceReadout.textContent = "Manual Lock";
+    setDisplaySource("Manual Lock");
     return;
   }
 
@@ -1290,6 +1357,7 @@ function updateDisplayedBpm(correctedBpm, confidence, source) {
     const gap = Math.abs(correctedBpm - currentStableCandidate.bpm);
     if (gap > 8 || currentStableCandidate.matchesTopCluster) {
       displaySourceReadout.textContent = "Stable";
+      setDisplaySource("Consensus");
       screen(`fast estimate ignored: ${Math.round(correctedBpm)} BPM; stable candidate ${Math.round(currentStableCandidate.bpm)} BPM`);
       return;
     }
@@ -1301,6 +1369,7 @@ function updateDisplayedBpm(correctedBpm, confidence, source) {
     const gap = Math.abs(correctedBpm - currentStableCandidate.bpm);
     if (gap > 8 || currentStableCandidate.matchesTopCluster) {
       displaySourceReadout.textContent = "Stable";
+      setDisplaySource("Consensus");
       screen(`corrected estimate ignored: ${Math.round(correctedBpm)} BPM; stable candidate ${Math.round(currentStableCandidate.bpm)} BPM`);
       return;
     }
@@ -1321,7 +1390,18 @@ function updateDisplayedBpm(correctedBpm, confidence, source) {
   finalDisplayBpm = smoothedBpm;
   lastDisplayUpdateTime = performance.now();
   finalDisplayBpmReadout.textContent = String(Math.round(finalDisplayBpm));
-  displaySourceReadout.textContent = source === "manual" ? "Manual Lock" : source === "stable" ? "Stable" : source === "fast" ? "Fast" : "Corrected";
+  const sourceLabel = source === "manual"
+    ? "Manual Lock"
+    : source === "target-anchor"
+      ? "Target Anchor"
+      : source === "spectral"
+        ? "Spectral"
+        : source === "onset" || source === "fallback peak" || source === "onset/grid"
+          ? "Onset"
+          : source === "holding"
+            ? "Holding"
+            : "Consensus";
+  setDisplaySource(sourceLabel);
   setStatus(source === "manual" ? "Manual tempo calibrated" : tempoStateReadout.textContent);
   screen(`selected BPM: ${Math.round(correctedBpm)} (${Math.round(confidence)}%)`);
   console.log("calculated BPM", { correctedBpm, smoothedBpm, confidence, source });
@@ -1902,6 +1982,7 @@ function buildTempoConsensus(enrichedScores, now, fastHistogram) {
   onsetEstimatorBpm = intervalCandidate?.bpm || multiBandCandidate?.bpm || null;
   spectralEstimatorBpm = spectralCandidate?.bpm || null;
   targetAssistedBpm = targetCandidate?.bpm || (target ? target : null);
+  candidateRejectionReason = candidateRejectionFor(rawGridCandidate, target);
   lastEstimatorUpdateTime = now;
 
   function estimatorWeight(name, candidate, baseWeight) {
@@ -2026,6 +2107,7 @@ function buildTempoConsensus(enrichedScores, now, fastHistogram) {
   consensusReadout.textContent = selected ? `${Math.round(selected.bpm)} (${selected.consensusConfidence}%, ${selected.matchingEstimators?.join("+") || "grid"})` : "--";
   estimatorAgreement = selected?.estimatorAgreement || 0;
   estimatorAgreementReadout.textContent = selected ? `${estimatorAgreement} estimators` : "--";
+  updateDetectionAvailabilityReadouts();
 
   return {
     selected,
@@ -2073,12 +2155,12 @@ function updateFastEstimate(now) {
   const spectralFast = spectralAutocorrelationCandidates(now);
   const anchorTarget = getTargetAnchorBpm();
   if (!hist.length && spectralFast.length) {
-    hist = spectralFast.map((candidate) => ({ ...candidate, targetAssisted: anchorTarget && Math.abs(candidate.bpm - anchorTarget) <= targetAnchorStrength().range }));
+    hist = spectralFast.map((candidate) => ({ ...candidate, source: "spectral", targetAssisted: anchorTarget && Math.abs(candidate.bpm - anchorTarget) <= targetAnchorStrength().range }));
   }
   if (!hist.length && anchorTarget && beatHistory.length >= 3) {
     const targetPrediction = predictionScore(anchorTarget, now);
     if (targetPrediction.confidence >= 0.34) {
-      hist = [{ bpm: anchorTarget, score: 0.45 + targetPrediction.confidence, targetAssisted: true }];
+      hist = [{ bpm: anchorTarget, score: 0.45 + targetPrediction.confidence, source: "target-anchor", targetAssisted: true }];
     }
   }
   if (!hist.length) {
@@ -2136,7 +2218,7 @@ function updateFastEstimate(now) {
       : `fast interval histogram; predicted beat hits ${prediction.hits}/${prediction.hits + prediction.misses}`;
     switchReasonReadout.textContent = best.targetAssisted ? "fast target-grid candidate" : "fast acquisition candidate";
     setTempoState("acquiring");
-    updateDisplayedBpm(corrected, fastConfidence, "fast");
+    updateDisplayedBpm(corrected, fastConfidence, best.targetAssisted ? "target-anchor" : best.source === "spectral" ? "spectral" : "onset");
     screen(`fast estimate ${Math.round(corrected)} BPM: hits ${prediction.hits}, misses ${prediction.misses}`);
   }
 
@@ -2396,7 +2478,8 @@ function estimateTempo(now, source) {
     const alignment = Math.round((candidate.aligned / candidate.count) * 100);
     const score = candidate.consensusScore ?? candidate.combinedScore;
     const estimators = candidate.matchingEstimators?.length ? ` ${candidate.matchingEstimators.join("+")}` : "";
-    return `${Math.round(candidate.bpm)} s${Math.round(score * 100)} a${alignment}% k${Math.round((candidate.kickReliability || 0) * 100)}${estimators} ${candidateRelationship(candidate, choice.selected)}`;
+    const rejection = candidateRejectionFor(candidate, targetAnchor);
+    return `${Math.round(candidate.bpm)} s${Math.round(score * 100)} a${alignment}% k${Math.round((candidate.kickReliability || 0) * 100)}${estimators} ${candidateRelationship(candidate, choice.selected)} ${rejection}`;
   }).join(" | ");
   topCandidatesReadout.textContent = topCandidateText;
   screen(`top candidates: ${topCandidateText}`);
@@ -2426,7 +2509,7 @@ function estimateTempo(now, source) {
         renderBpm(finalDisplayBpm);
         lastDisplayUpdateTime = now;
         finalDisplayBpmReadout.textContent = String(Math.round(finalDisplayBpm));
-        displaySourceReadout.textContent = "Stable";
+        setDisplaySource("Holding");
         lockReason = `holding ${Math.round(lastStableBpm || smoothedBpm || targetAnchor)} BPM; target ${targetAnchor ? Math.round(targetAnchor) : "--"}, phase ${Math.round(phase.agreement * 100)}%, disagreement ${disagreementBeats}/${disagreementLimit}`;
         switchReasonReadout.textContent = lockReason;
         setStatus("Holding BPM");
@@ -2460,7 +2543,8 @@ function estimateTempo(now, source) {
     && activeBeats.length >= Math.max(6, profile.stableBeats - 2)
     && choice.selected.estimatorAgreement >= 2
     && choice.selected.historySeconds >= Math.max(1.8, profile.stableSeconds - 1.2);
-  if ((choice.selected.confidence >= profile.stableConfidence && activeBeats.length >= profile.stableBeats && choice.selected.historySeconds >= profile.stableSeconds && choice.selected.historySupport >= 0.32) || targetStableCandidate) {
+  const realEstimatorEvidence = hasDetectedBpmEvidence(2500);
+  if (realEstimatorEvidence && ((choice.selected.confidence >= profile.stableConfidence && activeBeats.length >= profile.stableBeats && choice.selected.historySeconds >= profile.stableSeconds && choice.selected.historySupport >= 0.32) || targetStableCandidate)) {
     setTempoState("stable");
     lastStableBpm = corrected;
     expectedBpm = corrected;
@@ -2676,6 +2760,12 @@ function resetDetectionState() {
   spectralEstimatorBpm = null;
   targetAssistedBpm = null;
   finalDisplayBpm = null;
+  lastEstimatorUpdateTime = 0;
+  lastDisplayUpdateTime = 0;
+  detectedBpmAvailable = false;
+  anchorOnlyDisplay = false;
+  displaySourceLabel = "--";
+  candidateRejectionReason = "--";
   mixDensity = 0;
   rejectedHighNoiseCount = 0;
   onsetEventHistory = [];
@@ -2718,6 +2808,9 @@ function resetDetectionState() {
   targetAssistedBpmReadout.textContent = "--";
   finalDisplayBpmReadout.textContent = "--";
   estimatorAgreementReadout.textContent = "--";
+  detectedBpmAvailableReadout.textContent = "false";
+  anchorOnlyReadout.textContent = "false";
+  candidateRejectionReadout.textContent = "--";
   consensusReadout.textContent = "--";
   fastEstimateReadout.textContent = "--";
   stableCandidateReadout.textContent = "--";
@@ -2970,11 +3063,18 @@ function detectLoop() {
       spectralEstimatorBpm = null;
       targetAssistedBpm = null;
       estimatorAgreement = 0;
+      detectedBpmAvailable = false;
+      anchorOnlyDisplay = false;
+      displaySourceLabel = "--";
+      candidateRejectionReason = "--";
       rawEstimatorBpmReadout.textContent = "--";
       onsetBpmReadout.textContent = "--";
       spectralBpmReadout.textContent = "--";
       targetAssistedBpmReadout.textContent = "--";
       estimatorAgreementReadout.textContent = "--";
+      detectedBpmAvailableReadout.textContent = "false";
+      anchorOnlyReadout.textContent = "false";
+      candidateRejectionReadout.textContent = "--";
     }
   } else if (tempoState === "stable" && lastTempoConfidence < 45) {
     setTempoState("reacquiring");
@@ -3196,6 +3296,9 @@ function validateDomReferences() {
     "targetAssistedBpmReadout",
     "finalDisplayBpmReadout",
     "estimatorAgreementReadout",
+    "detectedBpmAvailableReadout",
+    "anchorOnlyReadout",
+    "candidateRejectionReadout",
     "consensusReadout",
     "fastEstimateReadout",
     "stableCandidateReadout",
