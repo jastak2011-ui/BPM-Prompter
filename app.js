@@ -42,6 +42,10 @@ const selectedBpmReadout = document.getElementById("selectedBpmReadout");
 const selectionReasonReadout = document.getElementById("selectionReasonReadout");
 const targetErrorReadout = document.getElementById("targetErrorReadout");
 const topCandidatesReadout = document.getElementById("topCandidatesReadout");
+const multiBandBpmReadout = document.getElementById("multiBandBpmReadout");
+const spectralBpmReadout = document.getElementById("spectralBpmReadout");
+const targetAnchorBpmReadout = document.getElementById("targetAnchorBpmReadout");
+const consensusReadout = document.getElementById("consensusReadout");
 const fastEstimateReadout = document.getElementById("fastEstimateReadout");
 const stableCandidateReadout = document.getElementById("stableCandidateReadout");
 const displaySourceReadout = document.getElementById("displaySourceReadout");
@@ -126,6 +130,7 @@ let previousRms = 0;
 let previousPeak = 0;
 let previousBandEnergies = [0, 0, 0];
 let bandFluxHistory = [[], [], []];
+let spectralFluxHistory = [];
 let onsetStrength = 0;
 let currentThreshold = 0;
 let lastGroupedBeatTime = 0;
@@ -296,10 +301,10 @@ function isNearTarget(bpm, target = getTargetAnchorBpm(), range = 15) {
 function targetAnchorStrength() {
   const mode = getTargetAnchoringMode();
   if (mode === "strong") {
-    return { range: 15, boost: 0.34, outsidePenalty: 0.52, jumpConfidence: 82, jumpScoreRatio: 1.45 };
+    return { range: 15, boost: 0.5, outsidePenalty: 0.38, jumpConfidence: 88, jumpScoreRatio: 1.6 };
   }
   if (mode === "light") {
-    return { range: 18, boost: 0.18, outsidePenalty: 0.78, jumpConfidence: 74, jumpScoreRatio: 1.25 };
+    return { range: 18, boost: 0.24, outsidePenalty: 0.72, jumpConfidence: 76, jumpScoreRatio: 1.3 };
   }
   return { range: 0, boost: 0, outsidePenalty: 1, jumpConfidence: 0, jumpScoreRatio: 1 };
 }
@@ -1326,6 +1331,7 @@ function historySupportFor(candidateBpm, now) {
 
 function intervalHistogramCandidates(now) {
   const profile = getLockProfile();
+  const target = getTargetAnchorBpm();
   const sources = [
     { beats: beatHistory.filter((beat) => now - beat.time <= profile.fastWindowMs), weight: mixDensity > 0.45 ? 0.55 : 1 },
     { beats: kickBeatHistory.filter((beat) => now - beat.time <= profile.fastWindowMs), weight: mixDensity > 0.45 || kickConfidence > 0.62 ? 2.15 : 1.2 },
@@ -1347,7 +1353,10 @@ function intervalHistogramCandidates(now) {
         const rawBpm = 60000 / interval;
         const variants = [rawBpm, rawBpm * 2, rawBpm / 2, rawBpm * 4 / 3, rawBpm * 3 / 4];
         for (const variant of variants) {
-          const bpm = correctIntoRange(variant);
+          const bpm = target ? variant : correctIntoRange(variant);
+          if (bpm < 40 || bpm > 240) {
+            continue;
+          }
           const bucket = Math.round(bpm);
           const weight = (beats[i].strength + beats[j].strength) / 2 * (1 + (j - i === 1 ? 0.45 : 0)) * source.weight;
           bins.set(bucket, (bins.get(bucket) || 0) + weight);
@@ -1360,6 +1369,219 @@ function intervalHistogramCandidates(now) {
     .map(([bpm, score]) => ({ bpm, score }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 8);
+}
+
+function spectralAutocorrelationCandidates(now) {
+  const target = getTargetAnchorBpm();
+  const anchor = targetAnchorStrength();
+  const windowMs = tempoState === "stable" || tempoState === "holding" ? 12000 : 6500;
+  const recent = spectralFluxHistory.filter((entry) => now - entry.time <= windowMs);
+  if (recent.length < 28) {
+    return [];
+  }
+
+  const frameIntervals = [];
+  for (let i = 1; i < recent.length; i += 1) {
+    frameIntervals.push(recent[i].time - recent[i - 1].time);
+  }
+  const frameMs = median(frameIntervals) || 23;
+  const baseline = median(recent.map((entry) => entry.value));
+  const values = recent.map((entry) => Math.max(0, entry.value - baseline * 0.65));
+  const energy = values.reduce((total, value) => total + value * value, 0);
+  if (energy <= 0.000001) {
+    return [];
+  }
+
+  const candidateBpms = [];
+  if (target) {
+    for (let bpm = target - anchor.range; bpm <= target + anchor.range; bpm += 0.5) {
+      candidateBpms.push(bpm);
+    }
+    [target / 2, target * 2, target * 0.9, target * 0.95, target * 1.05, target * 1.1].forEach((bpm) => candidateBpms.push(bpm));
+  } else {
+    const { min, max } = getBpmRange();
+    for (let bpm = min; bpm <= max; bpm += 1) {
+      candidateBpms.push(bpm);
+    }
+  }
+
+  const scores = new Map();
+  for (const candidate of candidateBpms) {
+    const bpm = target ? candidate : correctIntoRange(candidate);
+    if (bpm < 40 || bpm > 240) {
+      continue;
+    }
+    const lag = Math.round((60000 / bpm) / frameMs);
+    if (lag < 4 || lag >= values.length - 4) {
+      continue;
+    }
+
+    let correlation = 0;
+    let overlapEnergy = 0;
+    for (let i = lag; i < values.length; i += 1) {
+      correlation += values[i] * values[i - lag];
+      overlapEnergy += values[i] * values[i];
+    }
+
+    const normalized = overlapEnergy > 0 ? correlation / Math.sqrt(energy * overlapEnergy) : 0;
+    const rounded = Math.round(bpm * 2) / 2;
+    scores.set(rounded, Math.max(scores.get(rounded) || 0, normalized));
+  }
+
+  return [...scores.entries()]
+    .map(([bpm, score]) => ({ bpm, score: Math.max(0, score), confidence: Math.round(Math.max(0, Math.min(1, score)) * 100) }))
+    .filter((candidate) => candidate.score > 0.02)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8);
+}
+
+function findNearestCandidate(candidates, bpm, range = 3) {
+  return candidates
+    .filter((candidate) => Math.abs(candidate.bpm - bpm) <= range)
+    .sort((a, b) => Math.abs(a.bpm - bpm) - Math.abs(b.bpm - bpm) || (b.combinedScore || b.score || 0) - (a.combinedScore || a.score || 0))[0] || null;
+}
+
+function findTargetAnchoredCandidate(enrichedScores, spectralCandidates, fastHistogram) {
+  const target = getTargetAnchorBpm();
+  if (!target) {
+    return null;
+  }
+
+  const anchor = targetAnchorStrength();
+  const pools = [
+    ...enrichedScores.map((candidate) => ({ ...candidate, source: "multi-band", score: candidate.combinedScore || candidate.score || 0 })),
+    ...spectralCandidates.map((candidate) => ({ ...candidate, source: "spectral", score: candidate.score || 0 })),
+    ...fastHistogram.map((candidate) => ({ ...candidate, source: "interval", score: candidate.score || 0 }))
+  ];
+
+  const nearTarget = pools
+    .filter((candidate) => Math.abs(candidate.bpm - target) <= anchor.range)
+    .sort((a, b) => {
+      const aDistance = Math.abs(a.bpm - target);
+      const bDistance = Math.abs(b.bpm - target);
+      const aWeighted = (a.score || 0) * (1 + anchor.boost * (1 - aDistance / Math.max(1, anchor.range)));
+      const bWeighted = (b.score || 0) * (1 + anchor.boost * (1 - bDistance / Math.max(1, anchor.range)));
+      return bWeighted - aWeighted;
+    })[0];
+
+  if (nearTarget) {
+    return nearTarget;
+  }
+
+  return [target / 2, target * 2]
+    .map((related) => findNearestCandidate(pools, related, Math.max(3, related * 0.035)))
+    .filter(Boolean)
+    .sort((a, b) => (b.score || 0) - (a.score || 0))[0] || null;
+}
+
+function buildTempoConsensus(enrichedScores, now, fastHistogram) {
+  const spectralCandidates = spectralAutocorrelationCandidates(now);
+  const target = getTargetAnchorBpm();
+  const anchor = targetAnchorStrength();
+  const multiBandCandidate = enrichedScores[0] || null;
+  const kickCandidate = [...enrichedScores]
+    .filter((candidate) => candidate.kickScore > 0 || candidate.kickReliability > 0)
+    .sort((a, b) => ((b.kickScore || 0) + (b.kickReliability || 0)) - ((a.kickScore || 0) + (a.kickReliability || 0)))[0] || null;
+  const spectralCandidate = spectralCandidates[0] || null;
+  const intervalCandidate = fastHistogram[0] || null;
+  const targetCandidate = findTargetAnchoredCandidate(enrichedScores, spectralCandidates, fastHistogram);
+  const votes = [];
+
+  function addVote(name, candidate, weight, confidence = null) {
+    if (!candidate || !candidate.bpm) {
+      return;
+    }
+    votes.push({
+      name,
+      bpm: candidate.bpm,
+      weight,
+      confidence: confidence ?? candidate.confidence ?? Math.round(Math.min(1, candidate.score || candidate.combinedScore || 0) * 100),
+      score: candidate.combinedScore || candidate.score || 0
+    });
+  }
+
+  addVote("multi-band", multiBandCandidate, mixDensity > 0.45 ? 0.28 : 0.34, multiBandCandidate?.confidence);
+  addVote("kick/low", kickCandidate, kickConfidence > 0.62 || mixDensity > 0.45 ? 0.34 : 0.2, Math.round(Math.max(kickConfidence, kickCandidate?.kickReliability || 0) * 100));
+  addVote("spectral", spectralCandidate, 0.3, spectralCandidate?.confidence);
+  addVote("interval", intervalCandidate, 0.12, intervalCandidate ? Math.round(Math.min(1, intervalCandidate.score / Math.max(1, fastHistogram[0]?.score || 1)) * 100) : 0);
+  if (target) {
+    addVote("target", targetCandidate || { bpm: target, score: 0.18, confidence: 45 }, getTargetAnchoringMode() === "strong" ? 0.46 : 0.24, targetCandidate?.confidence || 52);
+  }
+
+  const consensusScores = enrichedScores.map((candidate) => {
+    let voteScore = 0;
+    let agreement = 0;
+    const matchingVotes = [];
+    for (const vote of votes) {
+      const distance = Math.abs(candidate.bpm - vote.bpm);
+      const tolerance = Math.max(2.5, candidate.bpm * 0.025);
+      if (distance <= tolerance) {
+        const closeness = 1 - distance / tolerance;
+        voteScore += vote.weight * (0.35 + vote.confidence / 100 * 0.65) * closeness;
+        agreement += 1;
+        matchingVotes.push(vote.name);
+      }
+    }
+
+    const targetDistance = target ? Math.abs(candidate.bpm - target) : null;
+    const targetFactor = target
+      ? targetDistance <= anchor.range
+        ? 1 + anchor.boost * 0.75 * (1 - targetDistance / Math.max(1, anchor.range))
+        : anchor.outsidePenalty
+      : 1;
+    const stability = candidate.historySupport || 0;
+    const lowMid = Math.max(candidate.kickReliability || 0, candidate.snareReliability || 0);
+    const phase = candidate.phaseAgreement || 0;
+    const consensusScore = (candidate.combinedScore * 0.42 + voteScore * 0.38 + stability * 0.1 + lowMid * 0.06 + phase * 0.04) * targetFactor;
+    const consensusConfidence = Math.min(100, Math.round(
+      (candidate.confidence || 0) * 0.36
+      + Math.min(1, voteScore) * 31
+      + Math.min(1, agreement / 3) * 18
+      + lowMid * 10
+      + (target && targetDistance <= anchor.range ? 10 : 0)
+    ));
+
+    return {
+      ...candidate,
+      consensusScore,
+      consensusConfidence,
+      estimatorAgreement: agreement,
+      matchingEstimators: matchingVotes
+    };
+  }).sort((a, b) => b.consensusScore - a.consensusScore);
+
+  let selected = consensusScores[0] || enrichedScores[0];
+  let reason = `consensus: ${selected.matchingEstimators?.join(", ") || "multi-band"}`;
+
+  if (target) {
+    const nearTarget = consensusScores.find((candidate) => Math.abs(candidate.bpm - target) <= anchor.range);
+    if (nearTarget && selected && Math.abs(selected.bpm - target) > anchor.range) {
+      const outsideOverwhelming = selected.consensusConfidence >= anchor.jumpConfidence
+        && selected.consensusScore >= nearTarget.consensusScore * anchor.jumpScoreRatio
+        && selected.estimatorAgreement >= nearTarget.estimatorAgreement + 2;
+      if (!outsideOverwhelming) {
+        selected = nearTarget;
+        reason = `target consensus near ${Math.round(target)} BPM`;
+      }
+    } else if (nearTarget && selected === nearTarget) {
+      reason = `target consensus near ${Math.round(target)} BPM`;
+    }
+  }
+
+  multiBandBpmReadout.textContent = multiBandCandidate ? `${Math.round(multiBandCandidate.bpm)} (${Math.round(multiBandCandidate.confidence || 0)}%)` : "--";
+  spectralBpmReadout.textContent = spectralCandidate ? `${Math.round(spectralCandidate.bpm)} (${Math.round(spectralCandidate.confidence || 0)}%)` : "--";
+  targetAnchorBpmReadout.textContent = targetCandidate ? `${Math.round(targetCandidate.bpm)} (${Math.round(targetCandidate.confidence || 0)}%)` : target ? `${Math.round(target)} (anchor)` : "--";
+  consensusReadout.textContent = selected ? `${Math.round(selected.bpm)} (${selected.consensusConfidence}%, ${selected.matchingEstimators?.join("+") || "grid"})` : "--";
+
+  return {
+    selected,
+    scores: consensusScores,
+    spectralCandidates,
+    targetCandidate,
+    multiBandCandidate,
+    intervalCandidate,
+    reason
+  };
 }
 
 function predictionScore(candidateBpm, now) {
@@ -1420,7 +1642,17 @@ function updateFastEstimate(now) {
   fastEstimateReadout.textContent = `${Math.round(best.bpm)} (${fastConfidence}%)`;
 
   if (beatHistory.length >= 4 && fastConfidence >= profile.earlyConfidence) {
-    const corrected = correctIntoRange(best.bpm);
+    let corrected = correctIntoRange(best.bpm);
+    if (anchorTarget && !isNearTarget(corrected, anchorTarget, targetAnchorStrength().range)) {
+      const nearTargetVariant = [best.bpm, best.bpm * 2, best.bpm / 2]
+        .find((candidate) => isNearTarget(candidate, anchorTarget, targetAnchorStrength().range));
+      if (nearTargetVariant) {
+        corrected = nearTargetVariant;
+      } else if (fastConfidence < targetAnchorStrength().jumpConfidence) {
+        screen(`fast estimate withheld outside target: ${Math.round(corrected)} BPM`);
+        return best;
+      }
+    }
     if (firstEstimateTime === null) {
       firstEstimateTime = (now - startTime) / 1000;
       firstEstimateReadout.textContent = `${firstEstimateTime.toFixed(1)}s`;
@@ -1581,7 +1813,19 @@ function estimateTempo(now, source) {
     }
 
     const rawBpm = 60000 / mean(intervals);
-    const corrected = correctIntoRange(rawBpm);
+    const targetAnchor = getTargetAnchorBpm();
+    const anchor = targetAnchorStrength();
+    let corrected = correctIntoRange(rawBpm);
+    if (targetAnchor && !isNearTarget(corrected, targetAnchor, anchor.range)) {
+      const nearTargetVariant = [rawBpm, rawBpm * 2, rawBpm / 2]
+        .find((candidate) => isNearTarget(candidate, targetAnchor, anchor.range));
+      if (nearTargetVariant) {
+        corrected = nearTargetVariant;
+      } else {
+        screen(`early estimate withheld outside target: ${Math.round(corrected)} BPM`);
+        return;
+      }
+    }
     const confidence = 34;
     updateCandidateReadouts({ bpm: rawBpm }, { bpm: rawBpm / 2 }, { bpm: rawBpm * 2 }, { bpm: corrected });
     updateTempoReadouts(rawBpm, corrected, confidence);
@@ -1626,13 +1870,36 @@ function estimateTempo(now, source) {
   }).sort((a, b) => b.combinedScore - a.combinedScore);
   recordCandidateHistory(enrichedScores, now);
   let choice = chooseTempoCandidate(enrichedScores);
+  const consensus = buildTempoConsensus(enrichedScores, now, fastHistogram);
+  if (consensus.selected) {
+    choice = {
+      ...choice,
+      selected: {
+        ...consensus.selected,
+        confidence: consensus.selected.consensusConfidence ?? consensus.selected.confidence,
+        combinedScore: consensus.selected.consensusScore ?? consensus.selected.combinedScore
+      },
+      reason: consensus.reason
+    };
+  }
+  const rankedScores = consensus.scores?.length ? consensus.scores : enrichedScores;
 
   const continuityBpm = targetAnchor || expectedBpm;
   if (continuityBpm) {
-    const nearExpected = enrichedScores.find((score) => Math.abs(score.bpm - continuityBpm) <= (targetAnchor ? anchor.range : continuityBpm * 0.09));
-    const requiredRatio = targetAnchor ? 0.58 : 0.78;
-    if (nearExpected && nearExpected.combinedScore >= choice.selected.combinedScore * requiredRatio) {
-      choice = { ...choice, selected: nearExpected, reason: targetAnchor ? `target anchor near ${Math.round(targetAnchor)} BPM` : `expected tempo continuity near ${Math.round(expectedBpm)} BPM` };
+    const nearExpected = rankedScores.find((score) => Math.abs(score.bpm - continuityBpm) <= (targetAnchor ? anchor.range : continuityBpm * 0.09));
+    const requiredRatio = targetAnchor ? 0.52 : 0.78;
+    const nearScore = nearExpected?.consensusScore ?? nearExpected?.combinedScore ?? 0;
+    const selectedScore = choice.selected.consensusScore ?? choice.selected.combinedScore ?? 0;
+    if (nearExpected && nearScore >= selectedScore * requiredRatio) {
+      choice = {
+        ...choice,
+        selected: {
+          ...nearExpected,
+          confidence: nearExpected.consensusConfidence ?? nearExpected.confidence,
+          combinedScore: nearExpected.consensusScore ?? nearExpected.combinedScore
+        },
+        reason: targetAnchor ? `target anchor near ${Math.round(targetAnchor)} BPM` : `expected tempo continuity near ${Math.round(expectedBpm)} BPM`
+      };
     }
   }
 
@@ -1641,14 +1908,16 @@ function estimateTempo(now, source) {
   updateTempoReadouts(choice.bestRaw.bpm, corrected, choice.selected.confidence);
   updateTargetErrorReadout(corrected, choice.selected.confidence);
   selectionReasonReadout.textContent = choice.reason;
-  const topCandidateText = enrichedScores.slice(0, 5).map((candidate) => {
+  const topCandidateText = rankedScores.slice(0, 5).map((candidate) => {
     const alignment = Math.round((candidate.aligned / candidate.count) * 100);
-    return `${Math.round(candidate.bpm)} s${Math.round(candidate.combinedScore * 100)} a${alignment}% k${Math.round((candidate.kickReliability || 0) * 100)} ${candidateRelationship(candidate, choice.selected)}`;
+    const score = candidate.consensusScore ?? candidate.combinedScore;
+    const estimators = candidate.matchingEstimators?.length ? ` ${candidate.matchingEstimators.join("+")}` : "";
+    return `${Math.round(candidate.bpm)} s${Math.round(score * 100)} a${alignment}% k${Math.round((candidate.kickReliability || 0) * 100)}${estimators} ${candidateRelationship(candidate, choice.selected)}`;
   }).join(" | ");
   topCandidatesReadout.textContent = topCandidateText;
   screen(`top candidates: ${topCandidateText}`);
   const topClusterMatch = Math.abs(choice.bestRaw.bpm - choice.selected.bpm) <= 4
-    || enrichedScores.slice(0, 5).some((candidate) => Math.abs(candidate.bpm - choice.selected.bpm) <= 2);
+    || rankedScores.slice(0, 5).some((candidate) => Math.abs(candidate.bpm - choice.selected.bpm) <= 2);
   currentStableCandidate = {
     bpm: corrected,
     confidence: choice.selected.confidence,
@@ -1664,13 +1933,14 @@ function estimateTempo(now, source) {
     const unstableCandidate = offTargetJump || choice.selected.confidence < 55 || (swing > 10 && choice.selected.confidence < 72);
     if (unstableCandidate) {
       disagreementBeats += 1;
-      if (targetHold || denseHold || phase.agreement >= 0.46 || disagreementBeats < 7) {
+      const disagreementLimit = targetHold ? 12 : denseHold ? 10 : 7;
+      if (targetHold || denseHold || phase.agreement >= 0.46 || disagreementBeats < disagreementLimit) {
         setTempoState("holding");
         holdStartTime = holdStartTime || now;
         expectedBpm = lastStableBpm || targetAnchor || expectedBpm;
         renderBpm(lastStableBpm || smoothedBpm || targetAnchor);
         displaySourceReadout.textContent = "Stable";
-        lockReason = `holding ${Math.round(lastStableBpm || smoothedBpm || targetAnchor)} BPM; target ${targetAnchor ? Math.round(targetAnchor) : "--"}, phase ${Math.round(phase.agreement * 100)}%, disagreement ${disagreementBeats}/7`;
+        lockReason = `holding ${Math.round(lastStableBpm || smoothedBpm || targetAnchor)} BPM; target ${targetAnchor ? Math.round(targetAnchor) : "--"}, phase ${Math.round(phase.agreement * 100)}%, disagreement ${disagreementBeats}/${disagreementLimit}`;
         switchReasonReadout.textContent = lockReason;
         setStatus("Holding BPM");
         screen(lockReason);
@@ -1697,7 +1967,13 @@ function estimateTempo(now, source) {
 
   const profile = getLockProfile();
   stableCandidateReadout.textContent = `${Math.round(corrected)} (${choice.selected.confidence}%)`;
-  if (choice.selected.confidence >= profile.stableConfidence && activeBeats.length >= profile.stableBeats && choice.selected.historySeconds >= profile.stableSeconds && choice.selected.historySupport >= 0.32) {
+  const targetStableCandidate = targetAnchor
+    && isNearTarget(corrected, targetAnchor, anchor.range)
+    && choice.selected.confidence >= Math.max(48, profile.stableConfidence - 14)
+    && activeBeats.length >= Math.max(6, profile.stableBeats - 2)
+    && choice.selected.estimatorAgreement >= 2
+    && choice.selected.historySeconds >= Math.max(1.8, profile.stableSeconds - 1.2);
+  if ((choice.selected.confidence >= profile.stableConfidence && activeBeats.length >= profile.stableBeats && choice.selected.historySeconds >= profile.stableSeconds && choice.selected.historySupport >= 0.32) || targetStableCandidate) {
     setTempoState("stable");
     lastStableBpm = corrected;
     expectedBpm = corrected;
@@ -1770,6 +2046,10 @@ function handleFrame(frame) {
     bandFluxTotal += flux * bandWeights[i] * (1 + rhythmicRepeatBoost);
     previousBandEnergies[i] = previousBandEnergies[i] * 0.68 + normalizedBand * 0.32;
   }
+
+  const spectralFlux = Math.max(0, bandFluxes[0] * 1.55 + bandFluxes[1] * 1.15 + bandFluxes[2] * (mixDensity > 0.45 ? 0.22 : 0.55));
+  spectralFluxHistory.push({ time: now, value: spectralFlux });
+  spectralFluxHistory = spectralFluxHistory.filter((entry) => now - entry.time <= WINDOW_MS);
 
   const energyRise = Math.max(0, normalizedRms - previousRms);
   const peakRise = Math.max(0, frame.peak - previousPeak);
@@ -1869,6 +2149,7 @@ function resetDetectionState() {
   previousPeak = 0;
   previousBandEnergies = [0, 0, 0];
   bandFluxHistory = [[], [], []];
+  spectralFluxHistory = [];
   onsetStrength = 0;
   currentThreshold = 0;
   lastGroupedBeatTime = 0;
@@ -1918,6 +2199,10 @@ function resetDetectionState() {
   selectionReasonReadout.textContent = "--";
   targetErrorReadout.textContent = "--";
   topCandidatesReadout.textContent = "--";
+  multiBandBpmReadout.textContent = "--";
+  spectralBpmReadout.textContent = "--";
+  targetAnchorBpmReadout.textContent = "--";
+  consensusReadout.textContent = "--";
   fastEstimateReadout.textContent = "--";
   stableCandidateReadout.textContent = "--";
   displaySourceReadout.textContent = "--";
@@ -2371,6 +2656,10 @@ function validateDomReferences() {
     "lockSpeedSelect",
     "topCandidatesReadout",
     "selectionReasonReadout",
+    "multiBandBpmReadout",
+    "spectralBpmReadout",
+    "targetAnchorBpmReadout",
+    "consensusReadout",
     "fastEstimateReadout",
     "stableCandidateReadout",
     "displaySourceReadout",
