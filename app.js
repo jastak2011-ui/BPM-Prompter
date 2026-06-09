@@ -91,6 +91,7 @@ const tempoToleranceInput = document.getElementById("tempoToleranceInput");
 const debugModeSelect = document.getElementById("debugModeSelect");
 const targetAnchoringSelect = document.getElementById("targetAnchoringSelect");
 const debugPanel = document.getElementById("debugPanel");
+const accuracyTestPanel = document.getElementById("accuracyTestPanel");
 const testTargetBpmInput = document.getElementById("testTargetBpmInput");
 const testSongNameInput = document.getElementById("testSongNameInput");
 const testNotesInput = document.getElementById("testNotesInput");
@@ -667,6 +668,7 @@ function closePanels() {
 function applyDebugMode() {
   const enabled = debugModeSelect.value === "on";
   debugPanel.classList.toggle("debug-hidden", !enabled);
+  accuracyTestPanel.classList.toggle("hidden", !enabled);
   try {
     localStorage.setItem(DEBUG_MODE_KEY, debugModeSelect.value);
   } catch (error) {
@@ -2923,6 +2925,7 @@ function validateDomReferences() {
     "debugModeSelect",
     "targetAnchoringSelect",
     "debugPanel",
+    "accuracyTestPanel",
     "testTargetBpmInput",
     "testSongNameInput",
     "testNotesInput",
