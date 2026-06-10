@@ -232,6 +232,10 @@ let pendingAccuracyMarkers = [];
 let firstEstimatorMetricTime = null;
 let firstConsensusMetricTime = null;
 let firstStableMetricTime = null;
+let firstOnsetDetectedTime = null;
+let firstCandidateGeneratedTime = null;
+let firstRawBpmTime = null;
+let firstConsensusTime = null;
 
 function setStatus(message) {
   lastStatusMessage = message;
@@ -1063,6 +1067,33 @@ function setDisplaySource(label) {
   updateDetectionAvailabilityReadouts();
 }
 
+function markAccuracyMilestone(name, now = performance.now()) {
+  if (!accuracyTestActive) {
+    return;
+  }
+
+  const elapsed = now - accuracyTestStartedAt;
+  if (name === "onset" && firstOnsetDetectedTime === null) {
+    firstOnsetDetectedTime = elapsed;
+  } else if (name === "candidate" && firstCandidateGeneratedTime === null) {
+    firstCandidateGeneratedTime = elapsed;
+  } else if (name === "raw" && firstRawBpmTime === null) {
+    firstRawBpmTime = elapsed;
+  } else if (name === "consensus" && firstConsensusTime === null) {
+    firstConsensusTime = elapsed;
+  }
+}
+
+function formatMetricSeconds(ms) {
+  return ms === null ? null : Number((ms / 1000).toFixed(2));
+}
+
+function markFirstEstimatorEvidence(now = performance.now()) {
+  if (accuracyTestActive && firstEstimatorMetricTime === null) {
+    firstEstimatorMetricTime = now - accuracyTestStartedAt;
+  }
+}
+
 function candidateRejectionFor(candidate, target = getTargetAnchorBpm()) {
   if (!candidate || !target) {
     return "insufficient beat-grid support";
@@ -1176,6 +1207,10 @@ function currentAccuracyRow(marker = "") {
     time_to_first_estimator: firstEstimatorMetricTime === null ? null : Number((firstEstimatorMetricTime / 1000).toFixed(2)),
     time_to_first_consensus: firstConsensusMetricTime === null ? null : Number((firstConsensusMetricTime / 1000).toFixed(2)),
     time_to_stable: firstStableMetricTime === null ? null : Number((firstStableMetricTime / 1000).toFixed(2)),
+    first_onset_detected_time: formatMetricSeconds(firstOnsetDetectedTime),
+    first_candidate_generated_time: formatMetricSeconds(firstCandidateGeneratedTime),
+    first_raw_bpm_time: formatMetricSeconds(firstRawBpmTime),
+    first_consensus_time: formatMetricSeconds(firstConsensusTime),
     estimator_agreement: estimatorFresh ? estimatorAgreement : 0,
     detected_bpm_available: estimatorFresh ? detectedBpmAvailable : false,
     anchor_only: displayFresh ? anchorOnlyDisplay : false,
@@ -1291,6 +1326,10 @@ function summarizeAccuracyTest() {
     `Time to first BPM: ${formatDurationFromMs(firstBpm?.timestamp_ms)}`,
     `Time to first estimator: ${formatDurationFromMs(firstEstimatorMetric?.time_to_first_estimator * 1000)}`,
     `Time to first consensus: ${formatDurationFromMs(firstConsensusMetric?.time_to_first_consensus * 1000)}`,
+    `First onset detected: ${formatDurationFromMs(firstOnsetDetectedTime)}`,
+    `First candidate generated: ${formatDurationFromMs(firstCandidateGeneratedTime)}`,
+    `First raw BPM: ${formatDurationFromMs(firstRawBpmTime)}`,
+    `First consensus: ${formatDurationFromMs(firstConsensusTime)}`,
     `Time to within +/- 3 BPM: ${formatDurationFromMs(firstWithin3?.timestamp_ms)}`,
     `Time to stable lock: ${formatDurationFromMs((firstStableMetric?.time_to_stable * 1000) || firstStable?.timestamp_ms)}`,
     `Average error: ${avgError === null ? "--" : avgError.toFixed(2)} BPM`,
@@ -1313,6 +1352,10 @@ function startAccuracyTest() {
   firstEstimatorMetricTime = null;
   firstConsensusMetricTime = null;
   firstStableMetricTime = null;
+  firstOnsetDetectedTime = null;
+  firstCandidateGeneratedTime = null;
+  firstRawBpmTime = null;
+  firstConsensusTime = null;
   rejectedHighBpmCandidateCount = 0;
   rejectedSubdivisionCandidateCount = 0;
   rejectedCandidateKeys = new Set();
@@ -1431,7 +1474,12 @@ function updateDisplayedBpm(correctedBpm, confidence, source) {
     return;
   }
 
-  if (source !== "manual" && confidence < getMinConfidence()) {
+  const targetAnchor = getTargetAnchorBpm();
+  const spectralProvisionalAllowed = source === "spectral"
+    && targetAnchor
+    && Math.abs(correctedBpm - targetAnchor) <= 5
+    && confidence >= Math.max(18, getMinConfidence() - 12);
+  if (source !== "manual" && !spectralProvisionalAllowed && confidence < getMinConfidence()) {
     setStatus("Listening - low confidence");
     return;
   }
@@ -1568,6 +1616,7 @@ function getMinimumBeatSpacingMs() {
 }
 
 function registerRawOnset(time, strength, nextMode, allowDebugSpacing = false, transient = { type: "snare", weight: 1, reason: "unclassified" }) {
+  markAccuracyMilestone("onset", time);
   rawOnsetCount += 1;
   rawOnsetCounter.textContent = String(rawOnsetCount);
 
@@ -1944,10 +1993,14 @@ function intervalHistogramCandidates(now) {
     }
   }
 
-  return [...bins.entries()]
+  const candidates = [...bins.entries()]
     .map(([bpm, score]) => ({ bpm, score }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 8);
+  if (candidates.length) {
+    markAccuracyMilestone("candidate", now);
+  }
+  return candidates;
 }
 
 function spectralAutocorrelationCandidates(now) {
@@ -2010,11 +2063,15 @@ function spectralAutocorrelationCandidates(now) {
     scores.set(rounded, Math.max(scores.get(rounded) || 0, normalized));
   }
 
-  return [...scores.entries()]
+  const candidates = [...scores.entries()]
     .map(([bpm, score]) => ({ bpm, score: Math.max(0, score), confidence: Math.round(Math.max(0, Math.min(1, score)) * 100) }))
     .filter((candidate) => candidate.score > 0.02)
     .sort((a, b) => b.score - a.score)
     .slice(0, 8);
+  if (candidates.length) {
+    markAccuracyMilestone("candidate", now);
+  }
+  return candidates;
 }
 
 function findNearestCandidate(candidates, bpm, range = 3) {
@@ -2077,6 +2134,9 @@ function buildTempoConsensus(enrichedScores, now, fastHistogram) {
   candidateRejectionReason = candidateRejectionFor(rawGridCandidate, target);
   recordCandidateRejection(rawGridCandidate, candidateRejectionReason);
   lastEstimatorUpdateTime = now;
+  if (rawEstimatorBpm) {
+    markAccuracyMilestone("raw", now);
+  }
 
   function estimatorWeight(name, candidate, baseWeight) {
     if (!candidate || !target) {
@@ -2175,6 +2235,9 @@ function buildTempoConsensus(enrichedScores, now, fastHistogram) {
 
   let selected = consensusScores[0] || enrichedScores[0];
   let reason = `consensus: ${selected.matchingEstimators?.join(", ") || "multi-band"}`;
+  if (selected) {
+    markAccuracyMilestone("consensus", now);
+  }
 
   if (target) {
     const nearTarget = consensusScores.find((candidate) => Math.abs(candidate.bpm - target) <= anchor.range);
@@ -2247,12 +2310,22 @@ function updateFastEstimate(now) {
   let hist = intervalHistogramCandidates(now);
   const spectralFast = spectralAutocorrelationCandidates(now);
   const anchorTarget = getTargetAnchorBpm();
+  const spectralNearTarget = anchorTarget
+    ? spectralFast.find((candidate) => Math.abs(candidate.bpm - anchorTarget) <= 5 && candidate.confidence >= Math.max(18, getMinConfidence() - 12))
+    : null;
+  if (spectralNearTarget && (!hist.length || spectralNearTarget.score >= hist[0].score * 0.55)) {
+    hist = [
+      { ...spectralNearTarget, source: "spectral", targetAssisted: false },
+      ...hist.filter((candidate) => Math.abs(candidate.bpm - spectralNearTarget.bpm) > 2)
+    ];
+  }
   if (!hist.length && spectralFast.length) {
     hist = spectralFast.map((candidate) => ({ ...candidate, source: "spectral", targetAssisted: anchorTarget && Math.abs(candidate.bpm - anchorTarget) <= targetAnchorStrength().range }));
   }
   if (!hist.length && anchorTarget && beatHistory.length >= 2) {
     const targetPrediction = predictionScore(anchorTarget, now);
     if (targetPrediction.confidence >= 0.25) {
+      markAccuracyMilestone("candidate", now);
       hist = [{ bpm: anchorTarget, score: 0.45 + targetPrediction.confidence, source: "target-anchor", targetAssisted: true }];
     }
   }
@@ -2289,7 +2362,11 @@ function updateFastEstimate(now) {
   fastEstimateReadout.textContent = `${Math.round(best.bpm)} (${fastConfidence}%)`;
 
   const enoughFastEvidence = beatHistory.length >= 3 || (anchorTarget && beatHistory.length >= 2 && prediction.confidence >= 0.5);
-  if (enoughFastEvidence && fastConfidence >= Math.max(18, profile.earlyConfidence - 10)) {
+  const spectralProvisional = best.source === "spectral"
+    && anchorTarget
+    && Math.abs(best.bpm - anchorTarget) <= 5
+    && fastConfidence >= Math.max(18, profile.earlyConfidence - 14);
+  if ((enoughFastEvidence || spectralProvisional) && fastConfidence >= Math.max(18, profile.earlyConfidence - 14)) {
     let corrected = correctIntoRange(best.bpm);
     if (anchorTarget && !isNearTarget(corrected, anchorTarget, targetAnchorStrength().range)) {
       const nearTargetVariant = [best.bpm, best.bpm * 2, best.bpm / 2]
@@ -2305,12 +2382,24 @@ function updateFastEstimate(now) {
       firstEstimateTime = (now - startTime) / 1000;
       firstEstimateReadout.textContent = `${firstEstimateTime.toFixed(1)}s`;
     }
+    if (best.source === "spectral") {
+      spectralEstimatorBpm = best.bpm;
+      lastEstimatorUpdateTime = now;
+      markFirstEstimatorEvidence(now);
+    } else if (!best.targetAssisted) {
+      onsetEstimatorBpm = best.bpm;
+      lastEstimatorUpdateTime = now;
+      markAccuracyMilestone("raw", now);
+      markFirstEstimatorEvidence(now);
+    }
     updateCandidateReadouts({ bpm: best.bpm, score: best.score }, null, null, { bpm: corrected, score: best.score });
     updateTempoReadouts(best.bpm, corrected, fastConfidence);
     selectionReasonReadout.textContent = best.targetAssisted
       ? `fast target grid; predicted beat hits ${prediction.hits}/${prediction.hits + prediction.misses}`
-      : `fast interval histogram; predicted beat hits ${prediction.hits}/${prediction.hits + prediction.misses}`;
-    switchReasonReadout.textContent = best.targetAssisted ? "fast target-grid candidate" : "fast acquisition candidate";
+      : best.source === "spectral"
+        ? `provisional spectral lock near target; confidence grows after display`
+        : `fast interval histogram; predicted beat hits ${prediction.hits}/${prediction.hits + prediction.misses}`;
+    switchReasonReadout.textContent = best.targetAssisted ? "fast target-grid candidate" : best.source === "spectral" ? "provisional spectral candidate" : "fast acquisition candidate";
     setTempoState("acquiring");
     updateDisplayedBpm(corrected, fastConfidence, best.targetAssisted ? "target-anchor" : best.source === "spectral" ? "spectral" : "onset");
     screen(`fast estimate ${Math.round(corrected)} BPM: hits ${prediction.hits}, misses ${prediction.misses}`);
@@ -2879,6 +2968,10 @@ function resetDetectionState() {
   rejectedHighBpmCandidateCount = 0;
   rejectedSubdivisionCandidateCount = 0;
   rejectedCandidateKeys = new Set();
+  firstOnsetDetectedTime = null;
+  firstCandidateGeneratedTime = null;
+  firstRawBpmTime = null;
+  firstConsensusTime = null;
   onsetEventHistory = [];
   stableAnchorBpm = null;
   stableAnchorTime = null;
