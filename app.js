@@ -159,6 +159,10 @@ let lastGroupedBeatTime = 0;
 let beatCount = 0;
 let rawOnsetCount = 0;
 let ignoredDoubleHitCount = 0;
+let detectedTransientCount = 0;
+let groupedTransientCount = 0;
+let spectralCandidateCount = 0;
+let onsetCandidateCount = 0;
 let beatHistory = [];
 let kickBeatHistory = [];
 let midBeatHistory = [];
@@ -186,6 +190,8 @@ let predictionHits = 0;
 let predictionMisses = 0;
 let lastKickBeatTime = 0;
 let lastMidBeatTime = 0;
+let lastSoftTransientTime = 0;
+let lastSpectralProbeTime = 0;
 let kickConfidence = 0;
 let currentStableCandidate = null;
 let snareConfidence = 0;
@@ -1237,6 +1243,11 @@ function currentAccuracyRow(marker = "") {
     frames_processed: framesProcessed,
     estimator_fresh: estimatorFresh,
     display_fresh: displayFresh,
+    onset_threshold: Number(currentThreshold.toFixed(5)),
+    detected_transients: detectedTransientCount,
+    grouped_transients: groupedTransientCount,
+    spectral_candidate_count: spectralCandidateCount,
+    onset_candidate_count: onsetCandidateCount,
     onset_count: beatCount,
     raw_onset_count: rawOnsetCount,
     rejected_onset_count: rejectedHighNoiseCount,
@@ -1648,6 +1659,7 @@ function getMinimumBeatSpacingMs() {
 
 function registerRawOnset(time, strength, nextMode, allowDebugSpacing = false, transient = { type: "snare", weight: 1, reason: "unclassified" }) {
   markAccuracyMilestone("onset", time);
+  detectedTransientCount += 1;
   rawOnsetCount += 1;
   rawOnsetCounter.textContent = String(rawOnsetCount);
 
@@ -1725,6 +1737,7 @@ function registerGroupedBeat(time, strength, nextMode, allowDebugSpacing = false
 
   lastGroupedBeatTime = time;
   beatCount += 1;
+  groupedTransientCount += 1;
   onsetCounter.textContent = String(beatCount);
   groupedBeatCounter.textContent = String(beatCount);
   beatHistory.push({
@@ -1987,6 +2000,7 @@ function historySupportFor(candidateBpm, now) {
 }
 
 function intervalHistogramCandidates(now) {
+  onsetCandidateCount = 0;
   const profile = getLockProfile();
   const target = getTargetAnchorBpm();
   const sources = [
@@ -2029,6 +2043,7 @@ function intervalHistogramCandidates(now) {
     .map(([bpm, score]) => ({ bpm, score }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 8);
+  onsetCandidateCount = candidates.length;
   if (candidates.length) {
     markAccuracyMilestone("candidate", now);
   }
@@ -2036,6 +2051,7 @@ function intervalHistogramCandidates(now) {
 }
 
 function spectralAutocorrelationCandidates(now) {
+  spectralCandidateCount = 0;
   const target = getTargetAnchorBpm();
   const anchor = targetAnchorStrength();
   const windowMs = tempoState === "stable" || tempoState === "holding" ? 12000 : 6500;
@@ -2100,6 +2116,7 @@ function spectralAutocorrelationCandidates(now) {
     .filter((candidate) => candidate.score > 0.02)
     .sort((a, b) => b.score - a.score)
     .slice(0, 8);
+  spectralCandidateCount = candidates.length;
   if (candidates.length) {
     markAccuracyMilestone("candidate", now);
   }
@@ -2453,6 +2470,25 @@ function updateFastEstimate(now) {
   }
 
   return best;
+}
+
+function updateSparseIntroAcquisition(now, signalMoving) {
+  if (!signalMoving || locked || now - lastSpectralProbeTime < 350) {
+    return;
+  }
+
+  const target = getTargetAnchorBpm();
+  const enoughSpectralFrames = spectralFluxHistory.length >= 28;
+  if (!target || !enoughSpectralFrames || beatCount >= 4) {
+    return;
+  }
+
+  lastSpectralProbeTime = now;
+  const fast = updateFastEstimate(now);
+  if (fast?.source === "spectral") {
+    setTempoState(finalDisplayBpm ? "stabilizing" : "acquiring");
+    switchReasonReadout.textContent = "sparse intro spectral candidate";
+  }
 }
 
 function withConfidence(score, allScores) {
@@ -2944,6 +2980,16 @@ function handleFrame(frame) {
   const transient = classifyTransient(bandFluxes, bands, onsetStrength);
   const denseHighOnly = mixDensity > 0.48 && (transient.type === "hihat" || transient.type === "noise" || transient.type === "strum");
   const lacksLowMidConfirmation = kickFlux < kickThreshold * 0.72 && midFlux < midThreshold * 0.82;
+  const spectralRecent = spectralFluxHistory.slice(-60).map((entry) => entry.value);
+  const spectralFloor = spectralRecent.length ? median(spectralRecent) + mean(spectralRecent) * 0.34 : 0;
+  const targetAnchor = getTargetAnchorBpm();
+  const sparseIntro = targetAnchor && secondsListening > 1.5 && beatCount < 4 && mixDensity < 0.38;
+  const softDelayTransient = sparseIntro
+    && signalMoving
+    && onsetReady
+    && now - lastSoftTransientTime > Math.max(210, getMinimumBeatSpacingMs() * 0.62)
+    && onsetStrength > currentThreshold * 0.56
+    && spectralFlux > Math.max(spectralFloor, getNoiseFloor() * 0.35);
 
   if (clapDetected) {
     registerRawOnset(now, frame.peak, "fallback peak", true, { type: "kick", weight: 1.2, reason: "clap" });
@@ -2954,6 +3000,15 @@ function handleFrame(frame) {
       updateMixDensity(now, transient.type);
       registerRawOnset(now, onsetStrength, "onset/grid", false, transient);
     }
+  } else if (softDelayTransient) {
+    lastSoftTransientTime = now;
+    const softType = transient.type === "hihat" || transient.type === "noise" ? "strum" : transient.type;
+    updateMixDensity(now, softType);
+    registerRawOnset(now, Math.max(onsetStrength, spectralFlux * 1.8), "onset/grid", false, {
+      type: softType,
+      weight: softType === "kick" ? 0.9 : 0.58,
+      reason: "soft delay transient"
+    });
   } else if (fallbackDetected) {
     const fallbackTransient = (transient.type === "hihat" || transient.type === "strum") && mixDensity > 0.42 ? { type: "noise", weight: 0.22, reason: "dense fallback spike" } : transient;
     if (fallbackTransient.type === "noise" && mixDensity > 0.45) {
@@ -2969,6 +3024,7 @@ function handleFrame(frame) {
   }
 
   finalizeBeatCluster(now);
+  updateSparseIntroAcquisition(now, signalMoving);
   updateLevelDisplay();
 }
 
@@ -2989,6 +3045,10 @@ function resetDetectionState() {
   beatCount = 0;
   rawOnsetCount = 0;
   ignoredDoubleHitCount = 0;
+  detectedTransientCount = 0;
+  groupedTransientCount = 0;
+  spectralCandidateCount = 0;
+  onsetCandidateCount = 0;
   fastCandidate = null;
   fastConfidence = 0;
   firstEstimateTime = null;
@@ -2996,6 +3056,8 @@ function resetDetectionState() {
   predictedBeat = null;
   predictionHits = 0;
   predictionMisses = 0;
+  lastSoftTransientTime = 0;
+  lastSpectralProbeTime = 0;
   currentStableCandidate = null;
   snareConfidence = 0;
   highBandConfidence = 0;
@@ -3347,6 +3409,11 @@ function detectLoop() {
       avgInputLevel: Number(avgLevel.toFixed(4)),
       onsetStrength: Number(onsetStrength.toFixed(4)),
       currentThreshold: Number(currentThreshold.toFixed(4)),
+      onsetThreshold: Number(currentThreshold.toFixed(5)),
+      detectedTransients: detectedTransientCount,
+      groupedTransients: groupedTransientCount,
+      spectralCandidateCount,
+      onsetCandidateCount,
       rawOnsetCount,
       groupedBeatCount: beatCount,
       ignoredDoubleHitCount,
