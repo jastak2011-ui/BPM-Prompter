@@ -190,6 +190,9 @@ let kickConfidence = 0;
 let currentStableCandidate = null;
 let snareConfidence = 0;
 let highBandConfidence = 0;
+let kickDominance = 0;
+let strumDominance = 0;
+let lowVsHighEnergyRatio = 0;
 let estimatorAgreement = 0;
 let rawEstimatorBpm = null;
 let onsetEstimatorBpm = null;
@@ -1094,6 +1097,21 @@ function markFirstEstimatorEvidence(now = performance.now()) {
   }
 }
 
+function applyNearTargetDisplayNudge(bpm, confidence, source) {
+  const target = getTargetAnchorBpm();
+  if (!target || source === "manual" || source === "clap" || !Number.isFinite(bpm)) {
+    return bpm;
+  }
+
+  const gap = target - bpm;
+  if (gap <= 0 || gap > 3.5) {
+    return bpm;
+  }
+
+  const confidenceFactor = confidence < 45 ? 0.45 : confidence < 60 ? 0.28 : 0.14;
+  return bpm + gap * confidenceFactor;
+}
+
 function candidateRejectionFor(candidate, target = getTargetAnchorBpm()) {
   if (!candidate || !target) {
     return "insufficient beat-grid support";
@@ -1229,7 +1247,10 @@ function currentAccuracyRow(marker = "") {
     low_band_flux: Number(lowBandFlux.toFixed(5)),
     low_band_confidence: Number(kickConfidence.toFixed(3)),
     mid_band_confidence: Number(snareConfidence.toFixed(3)),
-    high_band_confidence: Number(highBandConfidence.toFixed(3))
+    high_band_confidence: Number(highBandConfidence.toFixed(3)),
+    kick_dominance: Number(kickDominance.toFixed(3)),
+    strum_dominance: Number(strumDominance.toFixed(3)),
+    low_vs_high_energy_ratio: Number(lowVsHighEnergyRatio.toFixed(3))
   };
 }
 
@@ -1484,6 +1505,8 @@ function updateDisplayedBpm(correctedBpm, confidence, source) {
     return;
   }
 
+  correctedBpm = applyNearTargetDisplayNudge(correctedBpm, confidence, source);
+
   if (source === "fast" && currentStableCandidate && currentStableCandidate.confidence >= 45) {
     const gap = Math.abs(correctedBpm - currentStableCandidate.bpm);
     if (gap > 8 || currentStableCandidate.matchesTopCluster) {
@@ -1549,6 +1572,9 @@ function classifyTransient(bandFluxes, bands, strength) {
   if (lowRatio > 0.42 && lowLevel > 0.16) {
     return { type: "kick", weight: 1.45, reason: "low pulse" };
   }
+  if (highRatio > 0.44 && lowRatio < 0.3 && midRatio > 0.22) {
+    return { type: "strum", weight: mixDensity > 0.38 ? 0.26 : 0.42, reason: "high-mid strum" };
+  }
   if (midRatio > 0.34 && highRatio < 0.48) {
     return { type: "snare", weight: 1.15, reason: "mid pulse" };
   }
@@ -1573,8 +1599,13 @@ function updateMixDensity(now, transientType = null) {
   }
   onsetEventHistory = onsetEventHistory.filter((event) => now - event.time <= 3000);
   const highEvents = onsetEventHistory.filter((event) => event.type === "hihat" || event.type === "noise").length;
+  const strumEvents = onsetEventHistory.filter((event) => event.type === "strum").length;
+  const kickEvents = onsetEventHistory.filter((event) => event.type === "kick").length;
+  const snareEvents = onsetEventHistory.filter((event) => event.type === "snare").length;
   const eventRate = onsetEventHistory.length / 3;
-  const highRatio = onsetEventHistory.length ? highEvents / onsetEventHistory.length : 0;
+  const highRatio = onsetEventHistory.length ? (highEvents + strumEvents * 0.75) / onsetEventHistory.length : 0;
+  strumDominance = onsetEventHistory.length ? strumEvents / onsetEventHistory.length : 0;
+  kickDominance = onsetEventHistory.length ? kickEvents / Math.max(1, kickEvents + snareEvents + strumEvents) : 0;
   mixDensity = Math.max(mixDensity * 0.88, Math.min(1, eventRate / 8 + highRatio * 0.35));
 }
 
@@ -1796,10 +1827,11 @@ function scoreTempo(candidateBpm, now) {
   const snareReliability = midScore && midScore.count >= 4 ? Math.min(1, midAlignment * 0.62 + midScore.score * 0.38) : 0;
   kickConfidence = Math.max(kickConfidence * 0.85, kickReliability);
   snareConfidence = Math.max(snareConfidence * 0.85, snareReliability);
-  const denseMix = mixDensity > 0.48;
+  const denseMix = mixDensity > 0.48 || strumDominance > 0.34;
   const strongLowPulse = kickReliability > 0.58 || kickConfidence > 0.62;
-  const kickWeight = denseMix || strongLowPulse ? 0.58 : 0.28;
-  const midWeight = denseMix ? 0.28 : 0.18;
+  const acousticStrumBias = strumDominance > 0.32 && kickReliability < 0.42;
+  const kickWeight = denseMix || strongLowPulse ? acousticStrumBias ? 0.52 : 0.62 : 0.32;
+  const midWeight = denseMix ? 0.3 : 0.2;
   const fullWeight = Math.max(0.12, 1 - kickWeight - midWeight);
   const phase = stableAnchorBpm ? phaseAgreement(candidateBpm, now, 10) : { agreement: 0 };
   const phaseBoost = stableAnchorBpm && Math.abs(candidateBpm - stableAnchorBpm) <= Math.max(3, stableAnchorBpm * 0.035)
@@ -1958,12 +1990,12 @@ function intervalHistogramCandidates(now) {
   const profile = getLockProfile();
   const target = getTargetAnchorBpm();
   const sources = [
-    { beats: beatHistory.filter((beat) => now - beat.time <= profile.fastWindowMs), weight: mixDensity > 0.45 ? 0.55 : 1 },
-    { beats: kickBeatHistory.filter((beat) => now - beat.time <= profile.fastWindowMs), weight: mixDensity > 0.45 || kickConfidence > 0.62 ? 2.15 : 1.2 },
-    { beats: midBeatHistory.filter((beat) => now - beat.time <= profile.fastWindowMs), weight: mixDensity > 0.45 ? 1.15 : 0.9 }
+    { beats: beatHistory.filter((beat) => now - beat.time <= profile.fastWindowMs), weight: strumDominance > 0.32 ? 0.38 : mixDensity > 0.45 ? 0.55 : 1 },
+    { beats: kickBeatHistory.filter((beat) => now - beat.time <= profile.fastWindowMs), weight: mixDensity > 0.45 || kickConfidence > 0.62 || strumDominance > 0.32 ? 2.45 : 1.2 },
+    { beats: midBeatHistory.filter((beat) => now - beat.time <= profile.fastWindowMs), weight: mixDensity > 0.45 || strumDominance > 0.32 ? 1.35 : 0.9 }
   ];
   const bins = new Map();
-  if (!sources.some((source) => source.beats.length >= 3)) {
+  if (!sources.some((source) => source.beats.length >= (target ? 2 : 3))) {
     return [];
   }
 
@@ -2150,10 +2182,10 @@ function buildTempoConsensus(enrichedScores, now, fastHistogram) {
       || Math.abs(candidate.bpm * 0.75 - target) <= anchor.range;
 
     if (name === "spectral") {
-      return nearTarget ? baseWeight * 2.15 : relatedToTarget ? baseWeight * 0.8 : baseWeight * 0.45;
+      return nearTarget ? baseWeight * (strumDominance > 0.32 ? 2.55 : 2.15) : relatedToTarget ? baseWeight * 0.8 : baseWeight * 0.45;
     }
     if (name === "multi-band") {
-      return nearTarget ? baseWeight * 1.15 : relatedToTarget ? baseWeight * 0.38 : baseWeight * 0.22;
+      return nearTarget ? baseWeight * (strumDominance > 0.32 ? 1.45 : 1.15) : relatedToTarget ? baseWeight * 0.38 : baseWeight * 0.18;
     }
     if (name === "interval") {
       return nearTarget ? baseWeight * 0.9 : relatedToTarget ? baseWeight * 0.28 : baseWeight * 0.12;
@@ -2174,13 +2206,14 @@ function buildTempoConsensus(enrichedScores, now, fastHistogram) {
     });
   }
 
-  addVote("multi-band", multiBandCandidate, estimatorWeight("multi-band", multiBandCandidate, mixDensity > 0.45 ? 0.18 : 0.24), multiBandCandidate?.confidence);
-  addVote("kick/low", kickCandidate, kickConfidence > 0.62 || mixDensity > 0.45 ? 0.34 : 0.2, Math.round(Math.max(kickConfidence, kickCandidate?.kickReliability || 0) * 100));
+  addVote("multi-band", multiBandCandidate, estimatorWeight("multi-band", multiBandCandidate, mixDensity > 0.45 || strumDominance > 0.32 ? 0.16 : 0.24), multiBandCandidate?.confidence);
+  addVote("kick/low", kickCandidate, kickConfidence > 0.62 || mixDensity > 0.45 || strumDominance > 0.32 ? 0.4 : 0.22, Math.round(Math.max(kickConfidence, kickCandidate?.kickReliability || 0) * 100));
   addVote("spectral", spectralCandidate, estimatorWeight("spectral", spectralCandidate, 0.42), spectralCandidate?.confidence);
   addVote("interval", intervalCandidate, estimatorWeight("interval", intervalCandidate, 0.08), intervalCandidate ? Math.round(Math.min(1, intervalCandidate.score / Math.max(1, fastHistogram[0]?.score || 1)) * 100) : 0);
   if (target) {
     const spectralNearTarget = spectralCandidate && Math.abs(spectralCandidate.bpm - target) <= anchor.range;
-    addVote("target", targetCandidate || { bpm: target, score: spectralNearTarget ? 0.32 : 0.18, confidence: spectralNearTarget ? 64 : 45 }, getTargetAnchoringMode() === "strong" ? 0.54 : 0.28, targetCandidate?.confidence || (spectralNearTarget ? 64 : 52));
+    const targetVoteWeight = getTargetAnchoringMode() === "strong" ? (strumDominance > 0.32 ? 0.72 : 0.54) : 0.28;
+    addVote("target", targetCandidate || { bpm: target, score: spectralNearTarget ? 0.32 : 0.18, confidence: spectralNearTarget ? 64 : 45 }, targetVoteWeight, targetCandidate?.confidence || (spectralNearTarget ? 64 : 52));
   }
 
   const consensusScores = enrichedScores.map((candidate) => {
@@ -2201,7 +2234,7 @@ function buildTempoConsensus(enrichedScores, now, fastHistogram) {
     const targetDistance = target ? Math.abs(candidate.bpm - target) : null;
     const targetFactor = target
       ? targetDistance <= anchor.range
-        ? 1 + anchor.boost * 0.75 * (1 - targetDistance / Math.max(1, anchor.range))
+        ? 1 + anchor.boost * (strumDominance > 0.32 ? 0.88 : 0.75) * (1 - targetDistance / Math.max(1, anchor.range))
         : anchor.outsidePenalty
       : 1;
     const stability = candidate.historySupport || 0;
@@ -2210,7 +2243,10 @@ function buildTempoConsensus(enrichedScores, now, fastHistogram) {
     const targetNearness = target && targetDistance <= anchor.range ? 1 - targetDistance / Math.max(1, anchor.range) : 0;
     const spectralSupport = spectralCandidate && Math.abs(candidate.bpm - spectralCandidate.bpm) <= Math.max(3, candidate.bpm * 0.025) ? spectralCandidate.score : 0;
     const rawPenalty = target && targetDistance > anchor.range && (candidate.bpm > target * 1.35 || candidate.bpm < target * 0.68) ? 0.55 : 1;
-    const consensusScore = (candidate.combinedScore * 0.28 + voteScore * 0.46 + stability * 0.08 + lowMid * 0.06 + phase * 0.04 + spectralSupport * 0.08 + targetNearness * 0.08) * targetFactor * rawPenalty;
+    const nearTargetCorrection = target && targetDistance <= 4 && candidate.bpm < target && strumDominance > 0.25
+      ? 0.05 * (1 - targetDistance / 4)
+      : 0;
+    const consensusScore = (candidate.combinedScore * 0.27 + voteScore * 0.47 + stability * 0.08 + lowMid * 0.08 + phase * 0.04 + spectralSupport * 0.08 + targetNearness * 0.1 + nearTargetCorrection) * targetFactor * rawPenalty;
     const estimatorConflict = target && targetAssistedBpm && rawEstimatorBpm
       ? Math.min(1, Math.abs(rawEstimatorBpm - targetAssistedBpm) / Math.max(8, anchor.range))
       : 0;
@@ -2360,6 +2396,17 @@ function updateFastEstimate(now) {
   fastConfidence = Math.round(Math.min(95, (best.score / Math.max(1, hist[0].score)) * 34 + prediction.confidence * 42 + Math.min(1, beatHistory.length / 4) * 18 + spectralAgreement));
   fastCandidate = best.bpm;
   fastEstimateReadout.textContent = `${Math.round(best.bpm)} (${fastConfidence}%)`;
+  if (best.source === "spectral") {
+    spectralEstimatorBpm = best.bpm;
+    lastEstimatorUpdateTime = now;
+    markFirstEstimatorEvidence(now);
+  } else if (!best.targetAssisted) {
+    onsetEstimatorBpm = best.bpm;
+    rawEstimatorBpm = best.bpm;
+    lastEstimatorUpdateTime = now;
+    markAccuracyMilestone("raw", now);
+    markFirstEstimatorEvidence(now);
+  }
 
   const enoughFastEvidence = beatHistory.length >= 3 || (anchorTarget && beatHistory.length >= 2 && prediction.confidence >= 0.5);
   const spectralProvisional = best.source === "spectral"
@@ -2601,7 +2648,7 @@ function estimateTempo(now, source) {
     const fastBoost = fastSupport ? Math.min(0.18, fastSupport.score / Math.max(1, fastHistogram[0].score) * 0.18) : 0;
     const targetDistance = targetAnchor ? Math.abs(score.bpm - targetAnchor) : null;
     const targetBoost = targetAnchor && targetDistance <= anchor.range
-      ? anchor.boost * 1.25 * (1 - targetDistance / Math.max(1, anchor.range))
+      ? anchor.boost * (strumDominance > 0.32 ? 1.35 : 1.25) * (1 - targetDistance / Math.max(1, anchor.range))
       : 0;
     const subdivisionPenalty = targetAnchor && targetDistance > anchor.range && (
       Math.abs(score.bpm * 2 - targetAnchor) <= anchor.range
@@ -2728,7 +2775,7 @@ function estimateTempo(now, source) {
     && choice.selected.estimatorAgreement >= 2
     && choice.selected.historySeconds >= Math.max(1.8, profile.stableSeconds - 1.2);
   const tightTargetConsensus = targetAnchor
-    && Math.abs(corrected - targetAnchor) <= 2
+    && Math.abs(corrected - targetAnchor) <= 2.5
     && choice.selected.confidence >= Math.max(45, getMinConfidence())
     && activeBeats.length >= 5
     && choice.selected.estimatorAgreement >= 2
@@ -2749,7 +2796,7 @@ function estimateTempo(now, source) {
       stableLockReadout.textContent = `${stableLockTime.toFixed(1)}s`;
       switchReasonReadout.textContent = tightTargetConsensus ? "stable target consensus within +/-2 BPM" : `stable after ${choice.selected.historySeconds.toFixed(1)}s dominance`;
     }
-  } else if (realEstimatorEvidence && tempoState !== "holding" && targetAnchor && Math.abs(corrected - targetAnchor) <= 2 && choice.selected.confidence >= 38 && activeBeats.length >= 4) {
+  } else if (realEstimatorEvidence && tempoState !== "holding" && targetAnchor && Math.abs(corrected - targetAnchor) <= 3.5 && choice.selected.confidence >= 34 && activeBeats.length >= 4) {
     setTempoState("holding");
     holdStartTime = holdStartTime || now;
     disagreementBeats = Math.max(0, disagreementBeats - 1);
@@ -2851,6 +2898,7 @@ function handleFrame(frame) {
   const midFlux = bandFluxes[1];
   lowBandEnergy = bands[0] || 0;
   lowBandFlux = kickFlux;
+  lowVsHighEnergyRatio = (bands[0] || 0) / Math.max(0.0001, bands[2] || 0);
   kickStrengthHistory.push(kickFlux);
   midStrengthHistory.push(midFlux);
   if (kickStrengthHistory.length > 90) {
@@ -2878,7 +2926,7 @@ function handleFrame(frame) {
   if (kickStrengthHistory.length > 6 && kickFlux > kickThreshold && (lowBandEnergy > getNoiseFloor() * 0.55 || relativeLowRise > 1.65)) {
     registerBandBeat("kick", now, Math.max(kickFlux * 2.2, lowBandEnergy * 0.55));
   }
-  if (midStrengthHistory.length > 8 && midFlux > midThreshold) {
+  if (midStrengthHistory.length > 8 && midFlux > midThreshold && !(bandFluxes[2] > midFlux * 1.28 && kickFlux < kickThreshold * 0.65)) {
     registerBandBeat("mid", now, midFlux);
   }
 
@@ -2894,7 +2942,7 @@ function handleFrame(frame) {
   const clapThreshold = Math.max(getNoiseFloor() * 7, avgLevel * 2.8, 0.035);
   const clapDetected = clapMode && frame.peak > clapThreshold && peakRise > getNoiseFloor() * 1.5;
   const transient = classifyTransient(bandFluxes, bands, onsetStrength);
-  const denseHighOnly = mixDensity > 0.48 && (transient.type === "hihat" || transient.type === "noise");
+  const denseHighOnly = mixDensity > 0.48 && (transient.type === "hihat" || transient.type === "noise" || transient.type === "strum");
   const lacksLowMidConfirmation = kickFlux < kickThreshold * 0.72 && midFlux < midThreshold * 0.82;
 
   if (clapDetected) {
@@ -2907,7 +2955,7 @@ function handleFrame(frame) {
       registerRawOnset(now, onsetStrength, "onset/grid", false, transient);
     }
   } else if (fallbackDetected) {
-    const fallbackTransient = transient.type === "hihat" && mixDensity > 0.42 ? { type: "noise", weight: 0.22, reason: "dense fallback spike" } : transient;
+    const fallbackTransient = (transient.type === "hihat" || transient.type === "strum") && mixDensity > 0.42 ? { type: "noise", weight: 0.22, reason: "dense fallback spike" } : transient;
     if (fallbackTransient.type === "noise" && mixDensity > 0.45) {
       registerRejectedTransient(fallbackTransient.type, fallbackTransient.reason);
     } else {
@@ -2951,6 +2999,9 @@ function resetDetectionState() {
   currentStableCandidate = null;
   snareConfidence = 0;
   highBandConfidence = 0;
+  kickDominance = 0;
+  strumDominance = 0;
+  lowVsHighEnergyRatio = 0;
   estimatorAgreement = 0;
   rawEstimatorBpm = null;
   onsetEstimatorBpm = null;
@@ -3303,6 +3354,9 @@ function detectLoop() {
       mixDensity: Number(mixDensity.toFixed(3)),
       kickConfidence: Number(kickConfidence.toFixed(3)),
       snareConfidence: Number(snareConfidence.toFixed(3)),
+      kickDominance: Number(kickDominance.toFixed(3)),
+      strumDominance: Number(strumDominance.toFixed(3)),
+      lowVsHighEnergyRatio: Number(lowVsHighEnergyRatio.toFixed(3)),
       rejectedHighNoiseCount,
       holdReason: lockReason,
       selectedBpm: smoothedBpm ? Math.round(smoothedBpm) : null
